@@ -1,6 +1,6 @@
 {
   "name": "lawflow-agent",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "LawFlow 로컬 에이전트 - 전자소송 인증서 연동 및 서류 제출",
   "author": "LawFlow",
   "main": "main.js",

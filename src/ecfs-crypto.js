@@ -215,10 +215,16 @@ function _decryptPbes2(params, password, encData) {
  * seedCBCWithSHA1 (OID 1.2.410.200004.1.15) 복호화
  *
  * PBKDF1-SHA1:
- *   hash = SHA1(password_bytes || salt)
- *   for i in 1..iterations-1: hash = SHA1(hash)
- *   DK = hash[0:16]  (키)
- *   IV = SHA1(DK)[0:16]
+ *   T₁ = SHA1(password || salt)
+ *   for i in 2..count: Tᵢ = SHA1(Tᵢ₋₁)
+ *   DK = Tₙ[0:16]
+ *
+ * IV 유도 방법은 한국 NPKI 구현체마다 다름:
+ *   A) IV = SHA1(DK)[0:16]          (KISA 표준, 대부분의 구현)
+ *   B) IV = SHA1(Tₙ)[0:16]          (일부 구현 - Tₙ은 20바이트)
+ *   C) IV = DK XOR SHA1(DK)[0:16]   (일부 구버전 구현)
+ *
+ * 복호화된 결과가 유효한 ASN.1 (0x30 SEQUENCE)인 방법을 자동 선택합니다.
  *
  * params ASN.1:
  *   SEQUENCE { OCTET STRING(salt), INTEGER(iterations) }
@@ -229,7 +235,7 @@ function _decryptSeedCbcWithSha1(params, password, encData) {
 
   const pwBuf = Buffer.from(password, "utf8");
 
-  // PBKDF1: hash = SHA1(password || salt), 반복
+  // PBKDF1: T₁ = SHA1(password || salt), 반복
   let hash = crypto.createHash("sha1")
     .update(pwBuf)
     .update(salt)
@@ -239,10 +245,36 @@ function _decryptSeedCbcWithSha1(params, password, encData) {
     hash = crypto.createHash("sha1").update(hash).digest();
   }
 
-  const key = hash.slice(0, 16);
-  const iv  = crypto.createHash("sha1").update(hash).digest().slice(0, 16);
+  const dk = hash.slice(0, 16); // DK = Tₙ[0:16]
+  const sha1OfDk = crypto.createHash("sha1").update(dk).digest().slice(0, 16);
+  const sha1OfHash = crypto.createHash("sha1").update(hash).digest().slice(0, 16);
 
-  return seedDecryptCBC(key, iv, encData);
+  // IV 유도 후보 (한국 NPKI 구현체 간 차이 대응)
+  const xorIv = Buffer.alloc(16);
+  for (let i = 0; i < 16; i++) xorIv[i] = dk[i] ^ sha1OfDk[i];
+
+  const ivCandidates = [
+    { name: "SHA1(DK)[0:16]", iv: sha1OfDk },
+    { name: "SHA1(Tn)[0:16]", iv: sha1OfHash },
+    { name: "DK⊕SHA1(DK)[0:16]", iv: xorIv },
+  ];
+
+  // 각 IV로 복호화를 시도하여 유효한 PKCS#8 (0x30 SEQUENCE) 결과를 찾음
+  for (const { name, iv } of ivCandidates) {
+    try {
+      const plaintext = seedDecryptCBC(dk, iv, encData);
+      if (plaintext.length > 0 && plaintext[0] === 0x30) {
+        addLog(`IV 유도: ${name} (성공)`, "info");
+        return plaintext;
+      }
+    } catch {
+      // 패딩 에러 등 → 다음 후보 시도
+    }
+  }
+
+  // 모든 IV 후보 실패 → 첫 번째 방법으로 에러 전파 (비밀번호 오류 가능성)
+  addLog("모든 IV 유도 방법 실패 (비밀번호 확인 필요)", "error");
+  return seedDecryptCBC(dk, ivCandidates[0].iv, encData);
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +296,16 @@ function _parsePkcs8PrivateKey(derBuf) {
     throw new Error("복호화된 개인키 데이터가 비어있습니다 (비밀번호가 올바른지 확인하세요).");
   }
 
+  addLog(`복호화된 키 데이터: ${derBuf.length}바이트, 시작=${derBuf.slice(0, 8).toString("hex")}`, "info");
+
+  // 복호화된 데이터가 유효한 ASN.1 SEQUENCE인지 확인
+  if (derBuf[0] !== 0x30) {
+    throw new Error(
+      `복호화 결과가 유효하지 않습니다 (첫 바이트: 0x${derBuf[0].toString(16)}, 기대: 0x30). ` +
+      `비밀번호가 올바른지 확인하세요.`
+    );
+  }
+
   const binary = derBuf.toString("binary");
   const asn1   = forge.asn1.fromDer(binary, { strict: false, parseAllBytes: false });
 
@@ -275,7 +317,10 @@ function _parsePkcs8PrivateKey(derBuf) {
 
     // 방법 2: PKCS#8 PrivateKeyInfo에서 RSAPrivateKey OCTET STRING 직접 추출
     if (!asn1.value || !Array.isArray(asn1.value) || asn1.value.length < 3) {
-      throw new Error(`PKCS#8 구조 불일치 (필드 ${asn1.value ? asn1.value.length : 0}개): ${e1.message}`);
+      throw new Error(
+        `PKCS#8 구조 불일치 (필드 ${asn1.value ? asn1.value.length : 0}개). ` +
+        `복호화 결과가 올바르지 않습니다 (비밀번호 확인 필요): ${e1.message}`
+      );
     }
 
     const octetNode = asn1.value[2];
