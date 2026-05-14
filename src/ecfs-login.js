@@ -102,6 +102,7 @@ async function handleEcfsLogin(payload) {
       addLog("인증서 유효성 검증 통과", "success");
     } catch (cryptoErr) {
       addLog(`인증서 암호화 실패: ${cryptoErr.message}`, "error");
+      addLog(`스택: ${cryptoErr.stack?.substring(0, 500)}`, "error");
       _sendResult(
         requestId, false, null, null,
         `인증서 또는 비밀번호가 올바르지 않습니다: ${cryptoErr.message}`

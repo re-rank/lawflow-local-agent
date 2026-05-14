@@ -51,8 +51,16 @@ function setupAutoUpdater() {
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
 
+  autoUpdater.on("checking-for-update", () => {
+    addLog("업데이트 확인 중...", "info");
+  });
+
+  autoUpdater.on("update-not-available", (info) => {
+    addLog(`최신 버전입니다 (v${info.version})`, "info");
+  });
+
   autoUpdater.on("update-available", (info) => {
-    console.log(`업데이트 발견: v${info.version}`);
+    addLog(`업데이트 발견: v${info.version}, 다운로드 시작...`, "info");
     if (state.mainWindow) {
       state.mainWindow.webContents.send("update-status", {
         status: "downloading",
@@ -62,7 +70,7 @@ function setupAutoUpdater() {
   });
 
   autoUpdater.on("update-downloaded", (info) => {
-    console.log(`업데이트 다운로드 완료: v${info.version}`);
+    addLog(`업데이트 다운로드 완료: v${info.version}`, "success");
     if (state.mainWindow) {
       state.mainWindow.webContents.send("update-status", {
         status: "ready",
@@ -86,11 +94,13 @@ function setupAutoUpdater() {
   });
 
   autoUpdater.on("error", (err) => {
-    console.error("자동 업데이트 오류:", err.message);
+    addLog(`자동 업데이트 오류: ${err.message}`, "error");
   });
 
   // 앱 시작 후 업데이트 확인
-  autoUpdater.checkForUpdates().catch(() => {});
+  autoUpdater.checkForUpdates().catch((e) => {
+    addLog(`업데이트 확인 실패: ${e.message}`, "warning");
+  });
 }
 
 // ── Electron 라이프사이클 ────────────────────────────────

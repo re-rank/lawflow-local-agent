@@ -97,34 +97,62 @@ function asn1OctetBuffer(asn1Node) {
  * @returns {forge.pki.rsa.PrivateKey}
  */
 function decryptNpkiPrivateKey(keyPath, password) {
-  const keyDer = fs.readFileSync(keyPath);
-  const keyBinary = keyDer.toString("binary");
-  const asn1 = forge.asn1.fromDer(keyBinary, { strict: false, parseAllBytes: false });
+  // Step 1: 파일 읽기
+  let keyDer;
+  try {
+    keyDer = fs.readFileSync(keyPath);
+  } catch (e) {
+    throw new Error(`개인키 파일 읽기 실패 (${keyPath}): ${e.message}`);
+  }
+
+  // Step 2: ASN.1 파싱
+  let asn1;
+  try {
+    const keyBinary = keyDer.toString("binary");
+    asn1 = forge.asn1.fromDer(keyBinary, { strict: false, parseAllBytes: false });
+  } catch (e) {
+    throw new Error(`개인키 DER 파싱 실패: ${e.message}`);
+  }
 
   // 최상위: SEQUENCE { AlgorithmIdentifier, OCTET STRING }
-  if (asn1.type !== forge.asn1.Type.SEQUENCE || asn1.value.length < 2) {
+  if (!asn1 || asn1.type !== forge.asn1.Type.SEQUENCE || !Array.isArray(asn1.value) || asn1.value.length < 2) {
     throw new Error("EncryptedPrivateKeyInfo 구조가 올바르지 않습니다.");
   }
 
   const algId       = asn1.value[0]; // SEQUENCE { OID, params }
   const encDataNode = asn1.value[1]; // OCTET STRING
 
+  if (!algId || !algId.value || algId.value.length < 2) {
+    throw new Error("AlgorithmIdentifier 구조가 올바르지 않습니다.");
+  }
+
+  // Step 3: 암호화 알고리즘 식별
   const oid    = oidValue(algId.value[0]);
   const params = algId.value[1];
   const encData = asn1OctetBuffer(encDataNode);
 
-  let plaintext;
+  addLog(`개인키 암호화 알고리즘: ${oid}`, "info");
 
-  if (oid === OID_PBES2) {
-    plaintext = _decryptPbes2(params, password, encData);
-  } else if (oid === OID_SEED_CBC_WITH_SHA1) {
-    plaintext = _decryptSeedCbcWithSha1(params, password, encData);
-  } else {
-    throw new Error(`지원하지 않는 암호화 OID: ${oid}`);
+  // Step 4: 복호화
+  let plaintext;
+  try {
+    if (oid === OID_PBES2) {
+      plaintext = _decryptPbes2(params, password, encData);
+    } else if (oid === OID_SEED_CBC_WITH_SHA1) {
+      plaintext = _decryptSeedCbcWithSha1(params, password, encData);
+    } else {
+      throw new Error(`지원하지 않는 암호화 OID: ${oid}`);
+    }
+  } catch (e) {
+    throw new Error(`키 복호화 실패 (${oid}): ${e.message}`);
   }
 
-  // 복호화된 데이터는 PKCS#8 PrivateKeyInfo DER
-  return _parsePkcs8PrivateKey(plaintext);
+  // Step 5: PKCS#8 개인키 파싱
+  try {
+    return _parsePkcs8PrivateKey(plaintext);
+  } catch (e) {
+    throw new Error(`PKCS#8 개인키 파싱 실패: ${e.message}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -232,18 +260,36 @@ function _decryptSeedCbcWithSha1(params, password, encData) {
  *   }
  */
 function _parsePkcs8PrivateKey(derBuf) {
+  if (!derBuf || derBuf.length === 0) {
+    throw new Error("복호화된 개인키 데이터가 비어있습니다 (비밀번호가 올바른지 확인하세요).");
+  }
+
   const binary = derBuf.toString("binary");
   const asn1   = forge.asn1.fromDer(binary, { strict: false, parseAllBytes: false });
 
-  // forge.pki.privateKeyFromAsn1 는 PKCS#8 PrivateKeyInfo를 직접 처리합니다
+  // 방법 1: forge.pki.privateKeyFromAsn1로 PKCS#8 직접 처리
   try {
     return forge.pki.privateKeyFromAsn1(asn1);
-  } catch {
-    // 일부 KISA PKCS#8 구조는 수동 파싱 필요
-    // PrivateKeyInfo.value[2] = OCTET STRING containing RSAPrivateKey
-    const rsaKeyDer = asn1.value[2].value;
-    const rsaAsn1   = forge.asn1.fromDer(rsaKeyDer, { strict: false, parseAllBytes: false });
-    return forge.pki.privateKeyFromAsn1(rsaAsn1);
+  } catch (e1) {
+    addLog(`PKCS#8 직접 파싱 실패: ${e1.message}, 수동 파싱 시도...`, "info");
+
+    // 방법 2: PKCS#8 PrivateKeyInfo에서 RSAPrivateKey OCTET STRING 직접 추출
+    if (!asn1.value || !Array.isArray(asn1.value) || asn1.value.length < 3) {
+      throw new Error(`PKCS#8 구조 불일치 (필드 ${asn1.value ? asn1.value.length : 0}개): ${e1.message}`);
+    }
+
+    const octetNode = asn1.value[2];
+    if (!octetNode || !octetNode.value) {
+      throw new Error(`PKCS#8 개인키 OCTET STRING이 없습니다: ${e1.message}`);
+    }
+
+    try {
+      const rsaKeyDer = octetNode.value;
+      const rsaAsn1   = forge.asn1.fromDer(rsaKeyDer, { strict: false, parseAllBytes: false });
+      return forge.pki.privateKeyFromAsn1(rsaAsn1);
+    } catch (e2) {
+      throw new Error(`RSA 개인키 파싱 실패: ${e2.message} (원인: ${e1.message})`);
+    }
   }
 }
 
@@ -261,45 +307,59 @@ function _parsePkcs8PrivateKey(derBuf) {
  * @returns {string} Base64 인코딩된 CMS SignedData DER
  */
 function createCmsSignedData(plainText) {
-  // 1. 인증서 읽기 (DER → forge certificate)
-  const certDerBuf = fs.readFileSync(state.certPath);
-  const certAsn1   = forge.asn1.fromDer(
-    forge.util.createBuffer(certDerBuf.toString("binary")),
-    { strict: false, parseAllBytes: false }
-  );
-  const cert = forge.pki.certificateFromAsn1(certAsn1);
+  // Step 1: 인증서 읽기 (DER → forge certificate)
+  let cert;
+  try {
+    const certDerBuf = fs.readFileSync(state.certPath);
+    const certAsn1   = forge.asn1.fromDer(
+      forge.util.createBuffer(certDerBuf.toString("binary")),
+      { strict: false, parseAllBytes: false }
+    );
+    cert = forge.pki.certificateFromAsn1(certAsn1);
+  } catch (e) {
+    throw new Error(`[1단계] 인증서 읽기 실패 (${state.certPath}): ${e.message}`);
+  }
 
-  // 2. 개인키 복호화 (SEED-CBC 순수 JS 구현 사용)
-  const privateKey = decryptNpkiPrivateKey(state.certKeyPath, state.certPassword);
+  // Step 2: 개인키 복호화 (SEED-CBC 순수 JS 구현 사용)
+  let privateKey;
+  try {
+    privateKey = decryptNpkiPrivateKey(state.certKeyPath, state.certPassword);
+  } catch (e) {
+    throw new Error(`[2단계] 개인키 복호화 실패: ${e.message}`);
+  }
 
-  // 3. PKCS#7 SignedData 구성
-  const p7 = forge.pkcs7.createSignedData();
-  p7.content = forge.util.createBuffer(plainText, "utf8");
-  p7.addCertificate(cert);
-  p7.addSigner({
-    key: privateKey,
-    certificate: cert,
-    digestAlgorithm: forge.pki.oids.sha256,
-    authenticatedAttributes: [
-      {
-        type: forge.pki.oids.contentType,
-        value: forge.pki.oids.data,
-      },
-      {
-        type: forge.pki.oids.messageDigest,
-        // forge가 자동 계산
-      },
-      {
-        type: forge.pki.oids.signingTime,
-        value: new Date(),
-      },
-    ],
-  });
-  p7.sign();
+  // Step 3: PKCS#7 SignedData 구성 및 서명
+  try {
+    const p7 = forge.pkcs7.createSignedData();
+    p7.content = forge.util.createBuffer(plainText, "utf8");
+    p7.addCertificate(cert);
+    p7.addSigner({
+      key: privateKey,
+      certificate: cert,
+      digestAlgorithm: forge.pki.oids.sha256,
+      authenticatedAttributes: [
+        {
+          type: forge.pki.oids.contentType,
+          value: forge.pki.oids.data,
+        },
+        {
+          type: forge.pki.oids.messageDigest,
+          // forge가 자동 계산
+        },
+        {
+          type: forge.pki.oids.signingTime,
+          value: new Date(),
+        },
+      ],
+    });
+    p7.sign();
 
-  // 4. DER → Base64
-  const derBytes = forge.asn1.toDer(p7.toAsn1()).getBytes();
-  return forge.util.encode64(derBytes);
+    // DER → Base64
+    const derBytes = forge.asn1.toDer(p7.toAsn1()).getBytes();
+    return forge.util.encode64(derBytes);
+  } catch (e) {
+    throw new Error(`[3단계] CMS 서명 실패: ${e.message}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
