@@ -81,7 +81,7 @@ function asn1OctetBuffer(asn1Node) {
 function decryptNpkiPrivateKey(keyPath, password) {
   const keyDer = fs.readFileSync(keyPath);
   const keyBinary = keyDer.toString("binary");
-  const asn1 = forge.asn1.fromDer(keyBinary, { strict: false });
+  const asn1 = forge.asn1.fromDer(keyBinary, { strict: false, parseAllBytes: false });
 
   // 최상위: SEQUENCE { AlgorithmIdentifier, OCTET STRING }
   if (asn1.type !== forge.asn1.Type.SEQUENCE || asn1.value.length < 2) {
@@ -215,7 +215,7 @@ function _decryptSeedCbcWithSha1(params, password, encData) {
  */
 function _parsePkcs8PrivateKey(derBuf) {
   const binary = derBuf.toString("binary");
-  const asn1   = forge.asn1.fromDer(binary, { strict: false });
+  const asn1   = forge.asn1.fromDer(binary, { strict: false, parseAllBytes: false });
 
   // forge.pki.privateKeyFromAsn1 는 PKCS#8 PrivateKeyInfo를 직접 처리합니다
   try {
@@ -224,7 +224,7 @@ function _parsePkcs8PrivateKey(derBuf) {
     // 일부 KISA PKCS#8 구조는 수동 파싱 필요
     // PrivateKeyInfo.value[2] = OCTET STRING containing RSAPrivateKey
     const rsaKeyDer = asn1.value[2].value;
-    const rsaAsn1   = forge.asn1.fromDer(rsaKeyDer, { strict: false });
+    const rsaAsn1   = forge.asn1.fromDer(rsaKeyDer, { strict: false, parseAllBytes: false });
     return forge.pki.privateKeyFromAsn1(rsaAsn1);
   }
 }
@@ -247,7 +247,7 @@ function createCmsSignedData(plainText) {
   const certDerBuf = fs.readFileSync(state.certPath);
   const certAsn1   = forge.asn1.fromDer(
     forge.util.createBuffer(certDerBuf.toString("binary")),
-    { strict: false }
+    { strict: false, parseAllBytes: false }
   );
   const cert = forge.pki.certificateFromAsn1(certAsn1);
 
@@ -313,7 +313,7 @@ function createVidEnvelope(svrCertData) {
     svrCert = forge.pki.certificateFromPem(cleaned);
   } else {
     const svrDer  = forge.util.decode64(cleaned);
-    const svrAsn1 = forge.asn1.fromDer(svrDer, { strict: false });
+    const svrAsn1 = forge.asn1.fromDer(svrDer, { strict: false, parseAllBytes: false });
     svrCert = forge.pki.certificateFromAsn1(svrAsn1);
   }
 
