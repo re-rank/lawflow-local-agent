@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LawFlow Agent</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --blue-50: #eff6ff; --blue-100: #dbeafe; --blue-500: #3b82f6;
+      --blue-600: #2563eb; --blue-700: #1d4ed8;
+      --green-50: #f0fdf4; --green-100: #dcfce7; --green-600: #16a34a; --green-700: #15803d;
+      --red-50: #fef2f2; --red-100: #fee2e2; --red-600: #dc2626;
+      --amber-50: #fffbeb; --amber-700: #b45309;
+      --gray-50: #f9fafb; --gray-100: #f3f4f6; --gray-200: #e5e7eb;
+      --gray-300: #d1d5db; --gray-400: #9ca3af; --gray-500: #6b7280;
+      --gray-600: #4b5563; --gray-700: #374151; --gray-900: #111827;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: var(--gray-50);
+      color: var(--gray-900);
+      font-size: 13px;
+      -webkit-app-region: no-drag;
+      user-select: none;
+    }
+
+    /* ── 헤더 ── */
+    .header {
+      background: var(--blue-600);
+      color: white;
+      padding: 16px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      -webkit-app-region: drag;
+    }
+    .header-title {
+      font-size: 16px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .header-title svg { width: 22px; height: 22px; }
+    .status-badge {
+      font-size: 11px;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-weight: 500;
+      -webkit-app-region: no-drag;
+    }
+    .status-badge.connected { background: rgba(255,255,255,0.2); color: #bbf7d0; }
+    .status-badge.disconnected { background: rgba(255,255,255,0.15); color: #fde68a; }
+
+    /* ── 컨테이너 ── */
+    .container { padding: 16px 20px; display: flex; flex-direction: column; gap: 16px; }
+
+    /* ── 카드 ── */
+    .card {
+      background: white;
+      border: 1px solid var(--gray-200);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .card-header {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--gray-100);
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--gray-700);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .card-body { padding: 16px; }
+
+    /* ── 폼 ── */
+    .form-group { margin-bottom: 12px; }
+    .form-group:last-child { margin-bottom: 0; }
+    label {
+      display: block;
+      font-size: 11px;
+      color: var(--gray-500);
+      margin-bottom: 4px;
+      font-weight: 500;
+    }
+    input[type="text"], input[type="email"], input[type="password"] {
+      width: 100%;
+      padding: 8px 12px;
+      border: 1px solid var(--gray-300);
+      border-radius: 8px;
+      font-size: 13px;
+      background: var(--gray-50);
+      color: var(--gray-900);
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    input:focus { border-color: var(--blue-500); background: white; }
+    input:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    /* ── 버튼 ── */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 500;
+      border: none;
+      cursor: pointer;
+      transition: all 0.15s;
+      width: 100%;
+    }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary { background: var(--blue-600); color: white; }
+    .btn-primary:hover:not(:disabled) { background: var(--blue-700); }
+    .btn-danger { background: var(--red-600); color: white; }
+    .btn-danger:hover:not(:disabled) { background: #b91c1c; }
+    .btn-outline {
+      background: white;
+      color: var(--gray-700);
+      border: 1px solid var(--gray-300);
+    }
+    .btn-outline:hover:not(:disabled) { background: var(--gray-50); }
+    .btn-sm { padding: 6px 12px; font-size: 12px; }
+    .btn-row { display: flex; gap: 8px; }
+    .btn-row .btn { flex: 1; }
+
+    /* ── 상태 표시 ── */
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 12px;
+    }
+    .status-row.ok { background: var(--green-50); color: var(--green-700); }
+    .status-row.err { background: var(--red-50); color: var(--red-600); }
+    .status-row.warn { background: var(--amber-50); color: var(--amber-700); }
+    .status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .status-dot.green { background: var(--green-600); }
+    .status-dot.red { background: var(--red-600); }
+    .status-dot.gray { background: var(--gray-400); }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .status-dot.pulse { animation: pulse 2s infinite; }
+
+    /* ── 인증서 ── */
+    .cert-info {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      background: var(--gray-50);
+      border: 1px solid var(--gray-200);
+      border-radius: 8px;
+      font-size: 12px;
+      color: var(--gray-600);
+      margin-bottom: 8px;
+    }
+    .cert-info .name { flex: 1; font-weight: 500; color: var(--gray-900); }
+
+    /* ── 인증서 목록 ── */
+    .cert-list { max-height: 200px; overflow-y: auto; }
+    .cert-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      border: 1px solid var(--gray-200);
+      border-radius: 8px;
+      margin-bottom: 6px;
+      cursor: pointer;
+      transition: all 0.15s;
+      background: white;
+    }
+    .cert-item:hover { border-color: var(--blue-500); background: var(--blue-50); }
+    .cert-item.selected { border-color: var(--blue-600); background: var(--blue-50); }
+    .cert-item .cert-radio {
+      width: 16px; height: 16px;
+      border: 2px solid var(--gray-300);
+      border-radius: 50%;
+      flex-shrink: 0;
+      position: relative;
+    }
+    .cert-item.selected .cert-radio {
+      border-color: var(--blue-600);
+    }
+    .cert-item.selected .cert-radio::after {
+      content: '';
+      position: absolute;
+      top: 3px; left: 3px;
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--blue-600);
+    }
+    .cert-item-info { flex: 1; min-width: 0; }
+    .cert-item-subject { font-size: 13px; font-weight: 600; color: var(--gray-900); }
+    .cert-item-meta { font-size: 11px; color: var(--gray-500); margin-top: 2px; }
+    .cert-item-badge {
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-weight: 500;
+      flex-shrink: 0;
+    }
+    .cert-item-badge.npki { background: var(--green-100); color: var(--green-700); }
+    .cert-item-badge.pfx { background: var(--blue-100); color: var(--blue-600); }
+    .cert-empty {
+      text-align: center;
+      padding: 20px;
+      color: var(--gray-400);
+      font-size: 12px;
+    }
+
+    /* ── 로그 ── */
+    .log-area {
+      height: 140px;
+      overflow-y: auto;
+      background: var(--gray-900);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-family: 'Consolas', 'Courier New', monospace;
+      font-size: 11px;
+      line-height: 1.6;
+      color: var(--gray-400);
+    }
+    .log-area::-webkit-scrollbar { width: 6px; }
+    .log-area::-webkit-scrollbar-thumb { background: var(--gray-600); border-radius: 3px; }
+    .log-line { white-space: nowrap; }
+    .log-line .time { color: var(--gray-600); margin-right: 6px; }
+    .log-line.success { color: #4ade80; }
+    .log-line.error { color: #f87171; }
+    .log-line.warning { color: #fbbf24; }
+    .log-line.info { color: #93c5fd; }
+
+    /* ── 서버 URL (접기) ── */
+    .collapse-btn {
+      background: none; border: none; color: var(--gray-500);
+      font-size: 11px; cursor: pointer; padding: 4px 0;
+      display: flex; align-items: center; gap: 4px;
+    }
+    .collapse-btn:hover { color: var(--gray-700); }
+    .collapse-content { overflow: hidden; transition: max-height 0.2s; }
+    .collapse-content.hidden { max-height: 0; }
+    .collapse-content.visible { max-height: 100px; }
+
+    .heartbeat-info {
+      font-size: 11px;
+      color: var(--gray-500);
+      margin-top: 4px;
+    }
+
+    /* ── 스피너 ── */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner {
+      width: 14px; height: 14px;
+      border: 2px solid rgba(255,255,255,0.3);
+      border-top-color: white;
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+      display: inline-block;
+    }
+    .spinner.dark {
+      border-color: var(--gray-300);
+      border-top-color: var(--gray-600);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 헤더 -->
+  <div class="header">
+    <div class="header-title">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"></circle>
+        <path d="M12 1v6m0 6v6m-7-7h6m6 0h6m-2.636-8.364l-4.243 4.243m0 4.243l4.243 4.243m-12.728 0l4.243-4.243m0-4.243L4.636 4.636"></path>
+      </svg>
+      LawFlow Agent
+    </div>
+    <div id="headerBadge" class="status-badge disconnected">미연결</div>
+  </div>
+
+  <div class="container">
+    <!-- 로그인 / 연결 -->
+    <div class="card">
+      <div class="card-header">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
+        서버 연결
+      </div>
+      <div class="card-body">
+        <div class="form-group">
+          <label>아이디</label>
+          <input type="text" id="emailInput" placeholder="인증서 로그인에 사용하는 아이디" />
+        </div>
+        <div id="loginBtnWrap">
+          <button class="btn btn-primary" id="loginBtn" onclick="handleLogin()">
+            로그인 및 연결
+          </button>
+        </div>
+        <div id="connectedBtnWrap" style="display:none;">
+          <div class="status-row ok" style="margin-bottom:8px;">
+            <span class="status-dot green pulse"></span>
+            <span id="connectedMsg">서버에 연결되었습니다.</span>
+          </div>
+          <p class="heartbeat-info" id="heartbeatInfo"></p>
+          <button class="btn btn-danger btn-sm" onclick="handleDisconnect()" style="margin-top:8px;">
+            연결 해제
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 인증서 -->
+    <div class="card">
+      <div class="card-header">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        인증서 설정
+      </div>
+      <div class="card-body">
+        <!-- 스캔 전: 자동탐색 버튼 -->
+        <div id="certScanSection">
+          <p style="font-size:12px; color:var(--gray-500); margin-bottom:10px;">
+            시스템에 설치된 공동인증서를 자동으로 찾습니다.
+          </p>
+          <button class="btn btn-primary btn-sm" id="scanBtn" onclick="handleScanCerts()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            인증서 자동 탐색
+          </button>
+          <div style="margin-top:8px;">
+            <button class="btn btn-outline btn-sm" onclick="handleManualSelectCert()" style="font-size:11px;">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              직접 파일 선택
+            </button>
+          </div>
+        </div>
+
+        <!-- 스캔 결과: 인증서 목록 -->
+        <div id="certListSection" style="display:none;">
+          <div class="cert-list" id="certList"></div>
+          <div class="btn-row" style="margin-top:8px;">
+            <button class="btn btn-outline btn-sm" onclick="handleScanCerts()">다시 탐색</button>
+            <button class="btn btn-outline btn-sm" onclick="handleManualSelectCert()">직접 선택</button>
+          </div>
+        </div>
+
+        <!-- 인증서 선택 후: 비밀번호 입력 -->
+        <div id="certPasswordSection" style="display:none;">
+          <div class="cert-info">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            <span class="name" id="certSelectedName">-</span>
+            <span class="cert-item-badge" id="certSelectedBadge">-</span>
+          </div>
+          <div class="form-group">
+            <label>인증서 비밀번호</label>
+            <input type="password" id="certPwInput" placeholder="비밀번호 입력" />
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-primary btn-sm" onclick="handleSetCert()">적용</button>
+            <button class="btn btn-outline btn-sm" onclick="showCertList()">변경</button>
+          </div>
+        </div>
+
+        <!-- 적용 완료 상태 -->
+        <div id="certAppliedSection" style="display:none;">
+          <div class="status-row ok" style="margin-bottom:8px;">
+            <span class="status-dot green"></span>
+            <span id="certAppliedMsg">인증서가 적용되었습니다.</span>
+          </div>
+          <button class="btn btn-outline btn-sm" onclick="showCertList()">인증서 변경</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 활동 로그 -->
+    <div class="card">
+      <div class="card-header">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        활동 로그
+      </div>
+      <div class="card-body" style="padding:12px;">
+        <div class="log-area" id="logArea"></div>
+      </div>
+    </div>
+
+    <!-- 서버 URL 설정 (접이식) -->
+    <div>
+      <button class="collapse-btn" onclick="toggleServerUrl()">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+        <span id="collapseLabel">서버 URL 설정</span>
+      </button>
+      <div class="collapse-content hidden" id="serverUrlSection">
+        <div style="padding:8px 0;">
+          <input type="text" id="serverUrlInput" value="https://backendlawauto-production.up.railway.app" />
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ── 상태 ──
+    let isConnected = false;
+    let certFilePath = null;
+    let lastHeartbeat = null;
+
+    // ── 초기화 ──
+    (async () => {
+      const cfg = await window.agent.getConfig();
+      if (cfg.email) document.getElementById("emailInput").value = cfg.email;
+      if (cfg.serverUrl) document.getElementById("serverUrlInput").value = cfg.serverUrl;
+      addLog("LawFlow Agent가 시작되었습니다.", "info");
+    })();
+
+    // ── 이벤트 리스너 ──
+    window.agent.onStatus((data) => {
+      isConnected = data.connected;
+      updateUI();
+    });
+
+    window.agent.onLog((data) => {
+      addLog(data.message, data.type);
+    });
+
+    window.agent.onHeartbeat((data) => {
+      lastHeartbeat = data.timestamp;
+      updateHeartbeatInfo();
+    });
+
+    // ── UI 업데이트 ──
+    function updateUI() {
+      const badge = document.getElementById("headerBadge");
+      const loginWrap = document.getElementById("loginBtnWrap");
+      const connWrap = document.getElementById("connectedBtnWrap");
+      const emailInput = document.getElementById("emailInput");
+
+      if (isConnected) {
+        badge.textContent = "연결됨";
+        badge.className = "status-badge connected";
+        loginWrap.style.display = "none";
+        connWrap.style.display = "block";
+        emailInput.disabled = true;
+      } else {
+        badge.textContent = "미연결";
+        badge.className = "status-badge disconnected";
+        loginWrap.style.display = "block";
+        connWrap.style.display = "none";
+        emailInput.disabled = false;
+        lastHeartbeat = null;
+        updateHeartbeatInfo();
+      }
+    }
+
+    function updateHeartbeatInfo() {
+      const el = document.getElementById("heartbeatInfo");
+      if (!lastHeartbeat) {
+        el.textContent = "";
+        return;
+      }
+      const sec = Math.round((Date.now() - lastHeartbeat) / 1000);
+      el.textContent = `마지막 하트비트: ${sec}초 전`;
+    }
+
+    // 하트비트 시간 주기적 업데이트
+    setInterval(updateHeartbeatInfo, 5000);
+
+    // ── 로그 ──
+    function addLog(message, type = "info") {
+      const area = document.getElementById("logArea");
+      const now = new Date();
+      const time = [now.getHours(), now.getMinutes(), now.getSeconds()]
+        .map((n) => String(n).padStart(2, "0"))
+        .join(":");
+
+      const line = document.createElement("div");
+      line.className = `log-line ${type}`;
+      line.innerHTML = `<span class="time">${time}</span>${escapeHtml(message)}`;
+      area.appendChild(line);
+      area.scrollTop = area.scrollHeight;
+
+      // 최대 200줄 유지
+      while (area.children.length > 200) area.removeChild(area.firstChild);
+    }
+
+    function escapeHtml(str) {
+      const d = document.createElement("div");
+      d.textContent = str;
+      return d.innerHTML;
+    }
+
+    // ── 핸들러 ──
+    async function handleLogin() {
+      const email = document.getElementById("emailInput").value.trim();
+      const serverUrl = document.getElementById("serverUrlInput").value.trim();
+
+      if (!email) {
+        addLog("아이디를 입력하세요.", "error");
+        return;
+      }
+
+      const btn = document.getElementById("loginBtn");
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> 연결 중...';
+
+      const loginRes = await window.agent.login(email, serverUrl);
+
+      if (!loginRes.success) {
+        addLog(`로그인 실패: ${loginRes.error}`, "error");
+        btn.disabled = false;
+        btn.textContent = "로그인 및 연결";
+        return;
+      }
+
+      // WebSocket 연결
+      const connRes = await window.agent.connect(serverUrl);
+      if (!connRes.success) {
+        addLog(`연결 실패: ${connRes.error}`, "error");
+      }
+
+      btn.disabled = false;
+      btn.textContent = "로그인 및 연결";
+    }
+
+    async function handleDisconnect() {
+      await window.agent.disconnect();
+      addLog("연결을 해제했습니다.", "info");
+    }
+
+    let scannedCerts = [];
+    let selectedCertObj = null;
+
+    async function handleScanCerts() {
+      const scanBtn = document.getElementById("scanBtn");
+      if (scanBtn) {
+        scanBtn.disabled = true;
+        scanBtn.innerHTML = '<span class="spinner dark"></span> 탐색 중...';
+      }
+      addLog("인증서 자동 탐색 시작...", "info");
+
+      const res = await window.agent.scanCerts();
+      scannedCerts = res.certs || [];
+
+      if (scanBtn) {
+        scanBtn.disabled = false;
+        scanBtn.innerHTML = '인증서 자동 탐색';
+      }
+
+      if (scannedCerts.length === 0) {
+        addLog("설치된 인증서를 찾을 수 없습니다. 직접 파일을 선택하세요.", "warning");
+        return;
+      }
+
+      addLog(`인증서 ${scannedCerts.length}개 발견`, "success");
+      renderCertList();
+      document.getElementById("certScanSection").style.display = "none";
+      document.getElementById("certListSection").style.display = "block";
+      document.getElementById("certPasswordSection").style.display = "none";
+      document.getElementById("certAppliedSection").style.display = "none";
+    }
+
+    function renderCertList() {
+      const listEl = document.getElementById("certList");
+      if (scannedCerts.length === 0) {
+        listEl.innerHTML = '<div class="cert-empty">인증서를 찾을 수 없습니다.</div>';
+        return;
+      }
+
+      listEl.innerHTML = scannedCerts.map((cert, i) => `
+        <div class="cert-item" onclick="handleCertItemClick(${i})" id="certItem${i}">
+          <div class="cert-radio"></div>
+          <div class="cert-item-info">
+            <div class="cert-item-subject">${escapeHtml(cert.subject)}</div>
+            <div class="cert-item-meta">${escapeHtml(cert.issuer)} · ${cert.validTo !== "-" ? "만료: " + cert.validTo : cert.fileName}</div>
+          </div>
+          <span class="cert-item-badge ${cert.format}">${cert.format === "npki" ? "공동인증서" : "PFX"}</span>
+        </div>
+      `).join("");
+    }
+
+    function handleCertItemClick(index) {
+      selectedCertObj = scannedCerts[index];
+
+      // 선택 표시 업데이트
+      document.querySelectorAll(".cert-item").forEach((el, i) => {
+        el.classList.toggle("selected", i === index);
+      });
+
+      // 비밀번호 입력 섹션 표시
+      document.getElementById("certSelectedName").textContent = selectedCertObj.subject;
+      const badge = document.getElementById("certSelectedBadge");
+      badge.textContent = selectedCertObj.format === "npki" ? "공동인증서" : "PFX";
+      badge.className = "cert-item-badge " + selectedCertObj.format;
+
+      document.getElementById("certListSection").style.display = "none";
+      document.getElementById("certPasswordSection").style.display = "block";
+      document.getElementById("certPwInput").value = "";
+      document.getElementById("certPwInput").focus();
+
+      addLog(`인증서 선택: ${selectedCertObj.subject}`, "info");
+    }
+
+    async function handleManualSelectCert() {
+      const res = await window.agent.selectCert();
+      if (res.success) {
+        selectedCertObj = {
+          format: "pfx",
+          subject: res.path.split(/[\\/]/).pop().replace(/\.(pfx|p12)$/i, ""),
+          certPath: res.path,
+          keyPath: null,
+          fileName: res.path.split(/[\\/]/).pop(),
+        };
+
+        document.getElementById("certSelectedName").textContent = selectedCertObj.fileName;
+        const badge = document.getElementById("certSelectedBadge");
+        badge.textContent = "PFX";
+        badge.className = "cert-item-badge pfx";
+
+        document.getElementById("certScanSection").style.display = "none";
+        document.getElementById("certListSection").style.display = "none";
+        document.getElementById("certPasswordSection").style.display = "block";
+        document.getElementById("certPwInput").value = "";
+        document.getElementById("certPwInput").focus();
+
+        addLog(`인증서 파일 선택: ${selectedCertObj.fileName}`, "info");
+      }
+    }
+
+    function showCertList() {
+      if (scannedCerts.length > 0) {
+        document.getElementById("certScanSection").style.display = "none";
+        document.getElementById("certListSection").style.display = "block";
+      } else {
+        document.getElementById("certScanSection").style.display = "block";
+        document.getElementById("certListSection").style.display = "none";
+      }
+      document.getElementById("certPasswordSection").style.display = "none";
+      document.getElementById("certAppliedSection").style.display = "none";
+    }
+
+    async function handleSetCert() {
+      const pw = document.getElementById("certPwInput").value;
+      if (!selectedCertObj) {
+        addLog("인증서를 먼저 선택하세요.", "error");
+        return;
+      }
+      if (!pw) {
+        addLog("인증서 비밀번호를 입력하세요.", "error");
+        return;
+      }
+      const res = await window.agent.setCert(selectedCertObj, pw);
+      if (res.success) {
+        addLog("인증서가 적용되었습니다.", "success");
+        document.getElementById("certAppliedMsg").textContent =
+          `${selectedCertObj.subject} 인증서가 적용되었습니다.`;
+        document.getElementById("certPasswordSection").style.display = "none";
+        document.getElementById("certAppliedSection").style.display = "block";
+      }
+    }
+
+    function toggleServerUrl() {
+      const el = document.getElementById("serverUrlSection");
+      const label = document.getElementById("collapseLabel");
+      if (el.classList.contains("hidden")) {
+        el.classList.remove("hidden");
+        el.classList.add("visible");
+        label.textContent = "서버 URL 설정 (접기)";
+      } else {
+        el.classList.remove("visible");
+        el.classList.add("hidden");
+        label.textContent = "서버 URL 설정";
+      }
+    }
+
+    // Enter 키로 로그인
+    document.getElementById("emailInput").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") handleLogin();
+    });
+    // Enter 키로 인증서 비밀번호 적용
+    document.getElementById("certPwInput").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") handleSetCert();
+    });
+
+    // 시작 시 자동으로 인증서 탐색 실행
+    setTimeout(handleScanCerts, 500);
+  </script>
+</body>
+</html>
