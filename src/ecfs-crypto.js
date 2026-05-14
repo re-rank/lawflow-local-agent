@@ -18,6 +18,24 @@ const { addLog } = require("./utils");
 const { seedDecryptCBC } = require("./seed-cipher");
 
 // ---------------------------------------------------------------------------
+// forge.asn1.fromDer 패치: 한국 NPKI 인증서 trailing bytes 대응
+//
+// 한국 NPKI 인증서 파일(signCert.der, signPri.key)에는 ASN.1 구조 뒤에
+// 여분의 바이트가 있을 수 있습니다. forge 내부 함수(certificateFromAsn1,
+// privateKeyFromAsn1 등)가 fromDer를 호출할 때 기본값 parseAllBytes=true로
+// 인해 "Unparsed DER bytes remain" 에러가 발생합니다.
+// 모든 fromDer 호출에서 기본값을 parseAllBytes=false로 변경합니다.
+// ---------------------------------------------------------------------------
+const _origFromDer = forge.asn1.fromDer;
+forge.asn1.fromDer = function (bytes, options) {
+  const opts = Object.assign(
+    { strict: false, parseAllBytes: false },
+    options || {}
+  );
+  return _origFromDer.call(forge.asn1, bytes, opts);
+};
+
+// ---------------------------------------------------------------------------
 // OID 상수
 // ---------------------------------------------------------------------------
 
