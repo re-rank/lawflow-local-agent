@@ -63,6 +63,9 @@ let _loginInProgress = false;
 async function handleEcfsLogin(payload) {
   const { requestId } = payload;
 
+  // 수신 payload 전체 로깅 (디버깅)
+  addLog(`ECFS 로그인 payload: ${JSON.stringify(payload).substring(0, 300)}`, "info");
+
   // 중복 실행 방지
   if (_loginInProgress) {
     addLog("이전 로그인이 진행 중입니다. 요청 무시.", "warning");
@@ -92,6 +95,8 @@ async function handleEcfsLogin(payload) {
       return;
     }
 
+    addLog(`인증서: ${state.certPath}`, "info");
+    addLog(`개인키: ${state.certKeyPath}`, "info");
     addLog("전자소송 인증서 자동 로그인 시작...", "info");
     send("agent:efiling-status", { status: "processing", step: "ECFS 자동 로그인" });
 
@@ -335,7 +340,22 @@ async function handleEcfsLogin(payload) {
     addLog("로그인 데이터 주입 및 제출...", "info");
     send("agent:efiling-status", { status: "processing", step: "로그인 실행" });
 
-    const ecfsUserId = state.userId || "";
+    // ECFS 사용자 ID: payload에서 제공되면 사용, 없으면 state.userId 사용
+    const ecfsUserId = payload.ecfsUserId || payload.loginId || state.userId || "";
+    addLog(`ECFS 사용자ID: "${ecfsUserId}"`, "info");
+
+    // submission HTTP 요청 모니터링
+    let submissionRequestSent = false;
+    let submissionResponseReceived = false;
+    let submissionUrl = "";
+    page.on("response", (res) => {
+      const url = res.url();
+      if (url.includes("certlogin") || url.includes("psp001") || url.includes("login")) {
+        submissionResponseReceived = true;
+        submissionUrl = url;
+        addLog(`[응답] ${res.status()} ${url.substring(0, 100)}`, "info");
+      }
+    });
 
     const execResult = await page.evaluate((userId, signValArg, encVidArg) => {
       const log = [];
@@ -435,15 +455,17 @@ async function handleEcfsLogin(payload) {
     }
 
     if (!execResult.success) {
+      const execLogs = (execResult.log || []).join(" → ");
       addLog(`로그인 실행 실패 (${execResult.phase}): ${execResult.error}`, "error");
-      _sendResult(requestId, false, null, null, execResult.error);
+      _sendResult(requestId, false, null, null, `[${execResult.phase}] ${execResult.error} (${execLogs})`);
       send("agent:efiling-status", { status: "error", error: execResult.error });
       await browser.close().catch(() => {});
       return;
     }
 
     // ── 로그인 결과 대기 ──
-    addLog("로그인 결과 대기 중...", "info");
+    const execLogs = (execResult.log || []).join(" → ");
+    addLog(`로그인 실행 성공: ${execLogs}`, "info");
 
     try {
       await page.waitForFunction(
@@ -451,20 +473,30 @@ async function handleEcfsLogin(payload) {
         { timeout: LOGIN_TIMEOUT_MS }
       );
     } catch {
-      // 타임아웃 - 페이지 상태 확인
+      // 타임아웃 - 페이지 상태 + 디버그 정보 수집
       const finalState = await page
         .evaluate(() => ({
           url: location.href,
           text: document.body
-            ? document.body.innerText.replace(/\s+/g, " ").trim().substring(0, 300)
+            ? document.body.innerText.replace(/\s+/g, " ").trim().substring(0, 500)
             : "",
           result: window.__ecfsLoginResult,
           error: window.__ecfsLoginError,
+          hasScwin: !!window.mf_pfwork_scwin,
+          hasDma: !!window.mf_pfwork_dma_certparam,
+          dmaKeys: (() => {
+            try {
+              const d = window.mf_pfwork_dma_certparam;
+              return d ? Object.keys(d._data || d.data || {}).join(",") : "N/A";
+            } catch { return "에러"; }
+          })(),
         }))
         .catch(() => ({ url: "?", text: "(추출 실패)" }));
 
       addLog(`로그인 응답 대기 시간 초과. URL: ${finalState.url}`, "error");
-      addLog(`페이지: ${finalState.text}`, "info");
+      addLog(`HTTP요청전송=${submissionResponseReceived}, URL=${submissionUrl}`, "info");
+      addLog(`scwin=${finalState.hasScwin}, dma=${finalState.hasDma}, dmaKeys=${finalState.dmaKeys}`, "info");
+      addLog(`페이지: ${finalState.text.substring(0, 200)}`, "info");
 
       // 타임아웃이어도 로그인 성공했을 수 있음 (콜백이 호출되지 않은 경우)
       if (
@@ -479,9 +511,10 @@ async function handleEcfsLogin(payload) {
         return;
       }
 
+      const debugInfo = `scwin=${finalState.hasScwin},dma=${finalState.hasDma},httpSent=${submissionResponseReceived}`;
       _sendResult(
         requestId, false, null, null,
-        `로그인 응답 대기 시간 초과. 페이지: ${finalState.text.substring(0, 100)}`
+        `로그인 응답 대기 시간 초과 [${debugInfo}]. 페이지: ${finalState.text.substring(0, 150)}`
       );
       send("agent:efiling-status", { status: "error", error: "응답 대기 시간 초과" });
       await browser.close().catch(() => {});
