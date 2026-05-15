@@ -17,11 +17,19 @@ function scanCertificates() {
   const results = [];
   const home = os.homedir();
 
-  // 1. NPKI 디렉토리 목록 구성 (AppData 하위 폴더 3곳)
+  // 1. NPKI 디렉토리 목록 구성 (AppData 하위 폴더 3곳 + 벤더별 저장소)
   const npkiDirs = [
     path.join(home, "AppData", "LocalLow", "NPKI"),
     path.join(home, "AppData", "Local", "NPKI"),
     path.join(home, "AppData", "Roaming", "NPKI"),
+    // SoftForum (XecureWeb) 인증서 저장소
+    path.join(home, "AppData", "LocalLow", "SoftForum", "certstorage"),
+    // CrossCert (KeySharp) 인증서 저장소
+    path.join(home, "AppData", "LocalLow", "CrossCert"),
+    // KICA 인증서 저장소
+    path.join(home, "AppData", "LocalLow", "KICA"),
+    // SignKorea 인증서 저장소
+    path.join(home, "AppData", "LocalLow", "SignKorea"),
   ];
 
   // USB 드라이브 탐색: D: ~ Z: 드라이브의 NPKI 폴더

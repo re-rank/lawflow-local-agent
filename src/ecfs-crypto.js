@@ -97,10 +97,14 @@ function asn1OctetBuffer(asn1Node) {
  * @returns {forge.pki.rsa.PrivateKey}
  */
 function decryptNpkiPrivateKey(keyPath, password) {
+  addLog(`개인키 경로: ${keyPath}`, "info");
+  addLog(`비밀번호 길이: ${password ? password.length : "null"}자`, "info");
+
   // Step 1: 파일 읽기
   let keyDer;
   try {
     keyDer = fs.readFileSync(keyPath);
+    addLog(`개인키 파일 크기: ${keyDer.length}바이트`, "info");
   } catch (e) {
     throw new Error(`개인키 파일 읽기 실패 (${keyPath}): ${e.message}`);
   }
@@ -217,14 +221,11 @@ function _decryptPbes2(params, password, encData) {
  * PBKDF1-SHA1:
  *   T₁ = SHA1(password || salt)
  *   for i in 2..count: Tᵢ = SHA1(Tᵢ₋₁)
- *   DK = Tₙ[0:16]
+ *   DK = Tₙ (20바이트)
  *
- * IV 유도 방법은 한국 NPKI 구현체마다 다름:
- *   A) IV = SHA1(DK)[0:16]          (KISA 표준, 대부분의 구현)
- *   B) IV = SHA1(Tₙ)[0:16]          (일부 구현 - Tₙ은 20바이트)
- *   C) IV = DK XOR SHA1(DK)[0:16]   (일부 구버전 구현)
- *
- * 복호화된 결과가 유효한 ASN.1 (0x30 SEQUENCE)인 방법을 자동 선택합니다.
+ * 키/IV 유도 (PyPinkSign, twkang/gist 등 레퍼런스 구현 기준):
+ *   Key = DK[0:16]              (16바이트 SEED 키)
+ *   IV  = SHA1(DK[16:20])[0:16] (마지막 4바이트의 SHA1 해시)
  *
  * params ASN.1:
  *   SEQUENCE { OCTET STRING(salt), INTEGER(iterations) }
@@ -233,9 +234,15 @@ function _decryptSeedCbcWithSha1(params, password, encData) {
   const salt       = asn1OctetBuffer(params.value[0]);
   const iterations = asn1Integer(params.value[1]);
 
+  if (!password || password.length === 0) {
+    throw new Error("비밀번호가 비어있습니다.");
+  }
+
   const pwBuf = Buffer.from(password, "utf8");
 
-  // PBKDF1: T₁ = SHA1(password || salt), 반복
+  addLog(`seedCBC: salt=${salt.toString("hex")}, iter=${iterations}, pwLen=${pwBuf.length}`, "info");
+
+  // PBKDF1: T₁ = SHA1(password || salt), 반복 count회
   let hash = crypto.createHash("sha1")
     .update(pwBuf)
     .update(salt)
@@ -245,36 +252,46 @@ function _decryptSeedCbcWithSha1(params, password, encData) {
     hash = crypto.createHash("sha1").update(hash).digest();
   }
 
-  const dk = hash.slice(0, 16); // DK = Tₙ[0:16]
-  const sha1OfDk = crypto.createHash("sha1").update(dk).digest().slice(0, 16);
-  const sha1OfHash = crypto.createHash("sha1").update(hash).digest().slice(0, 16);
+  // hash = Tₙ (20바이트)
+  const key = hash.slice(0, 16);
+  // IV = SHA1(Tₙ[16:20])[0:16] — 마지막 4바이트를 SHA1 해싱
+  const tailBytes = hash.slice(16, 20);
+  const iv = crypto.createHash("sha1").update(tailBytes).digest().slice(0, 16);
 
-  // IV 유도 후보 (한국 NPKI 구현체 간 차이 대응)
-  const xorIv = Buffer.alloc(16);
-  for (let i = 0; i < 16; i++) xorIv[i] = dk[i] ^ sha1OfDk[i];
+  addLog(`seedCBC: key=${key.toString("hex")}, iv=${iv.toString("hex")}`, "info");
 
-  const ivCandidates = [
-    { name: "SHA1(DK)[0:16]", iv: sha1OfDk },
-    { name: "SHA1(Tn)[0:16]", iv: sha1OfHash },
-    { name: "DK⊕SHA1(DK)[0:16]", iv: xorIv },
+  try {
+    const plaintext = seedDecryptCBC(key, iv, encData);
+    if (plaintext.length > 0 && plaintext[0] === 0x30) {
+      addLog(`seedCBC 복호화 성공 (${plaintext.length}바이트)`, "success");
+      return plaintext;
+    }
+    addLog(`seedCBC 첫 바이트: 0x${plaintext[0].toString(16)} (기대: 0x30)`, "warning");
+  } catch (e) {
+    addLog(`seedCBC 복호화 실패: ${e.message}`, "warning");
+  }
+
+  // 실패 시 대체 IV 방법 시도 (구버전 호환)
+  const altIvCandidates = [
+    { name: "SHA1(Key)[0:16]", iv: crypto.createHash("sha1").update(key).digest().slice(0, 16) },
+    { name: "SHA1(Tn)[0:16]",  iv: crypto.createHash("sha1").update(hash).digest().slice(0, 16) },
   ];
 
-  // 각 IV로 복호화를 시도하여 유효한 PKCS#8 (0x30 SEQUENCE) 결과를 찾음
-  for (const { name, iv } of ivCandidates) {
+  for (const { name, iv: altIv } of altIvCandidates) {
     try {
-      const plaintext = seedDecryptCBC(dk, iv, encData);
+      const plaintext = seedDecryptCBC(key, altIv, encData);
       if (plaintext.length > 0 && plaintext[0] === 0x30) {
-        addLog(`IV 유도: ${name} (성공)`, "info");
+        addLog(`대체 IV 유도: ${name} (성공)`, "info");
         return plaintext;
       }
     } catch {
-      // 패딩 에러 등 → 다음 후보 시도
+      // 다음 후보 시도
     }
   }
 
-  // 모든 IV 후보 실패 → 첫 번째 방법으로 에러 전파 (비밀번호 오류 가능성)
-  addLog("모든 IV 유도 방법 실패 (비밀번호 확인 필요)", "error");
-  return seedDecryptCBC(dk, ivCandidates[0].iv, encData);
+  throw new Error(
+    "모든 IV 유도 방법 실패. 비밀번호가 올바른지 확인하세요."
+  );
 }
 
 // ---------------------------------------------------------------------------
