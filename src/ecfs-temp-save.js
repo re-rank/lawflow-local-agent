@@ -12,6 +12,11 @@ const { DOC_ROUTING, getFieldsMap } = require("./ecfs-form-fields");
 const ECFS_BASE = "https://ecfs.scourt.go.kr";
 const ECFS_PSP_URL = `${ECFS_BASE}/psp/index.on`;
 
+/** fillForm 재시도 횟수 */
+const FILL_RETRY_COUNT = 3;
+/** fillForm 재시도 간격 (ms) */
+const FILL_RETRY_DELAY = 2000;
+
 /**
  * ECFS 임시저장 요청을 처리한다.
  * @param {object} payload - { requestId, cookies, docType, draftData }
@@ -24,12 +29,21 @@ async function handleEcfsTempSave(payload, ws, userId) {
   let page = null;
 
   try {
-    addLog(`ECFS 임시저장 시작: ${docType}`, "info");
+    addLog(`ECFS 임시저장 시작: docType=${docType}`, "info");
 
     // 라우팅 정보 확인
     const routing = DOC_ROUTING[docType];
     if (!routing) {
       sendResult(ws, userId, requestId, false, `지원하지 않는 서류 유형: ${docType}`);
+      return;
+    }
+
+    // 폼 데이터 파싱 (미리 수행하여 데이터 문제 조기 발견)
+    const formData = parseFormData(draftData);
+    addLog(`파싱된 폼 데이터: caseBasic=${!!formData.caseBasic}, parties=${formData.parties.length}명, content.claimPurpose=${(formData.content.claimPurpose || "").substring(0, 30)}...`, "info");
+
+    if (!formData.caseBasic?.caseName && !formData.content?.claimPurpose && formData.parties.length === 0) {
+      sendResult(ws, userId, requestId, false, "ECFS에 입력할 폼 데이터가 없습니다. 서류 내용을 먼저 작성하세요.");
       return;
     }
 
@@ -47,7 +61,13 @@ async function handleEcfsTempSave(payload, ws, userId) {
     const launchOpts = {
       executablePath: chromePath,
       headless: "new",
-      args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
+      args: [
+        "--no-sandbox",
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
+        "--window-size=1280,900",
+      ],
     };
 
     browser = CloakBrowser
@@ -56,42 +76,63 @@ async function handleEcfsTempSave(payload, ws, userId) {
 
     page = await browser.newPage();
 
+    // Puppeteer stealth 설정 - headless 감지 회피
+    await applyStealthSettings(page);
+
     // 쿠키 설정
     const puppeteerCookies = cookies
-      .filter((c) => c.domain.includes("scourt.go.kr"))
+      .filter((c) => c.domain && c.domain.includes("scourt.go.kr"))
       .map((c) => ({
         name: c.name,
         value: c.value,
         domain: c.domain.startsWith(".") ? c.domain : `.${c.domain}`,
         path: "/",
       }));
+
+    if (puppeteerCookies.length === 0) {
+      sendResult(ws, userId, requestId, false, "ECFS 세션 쿠키가 없습니다. 인증서 로그인을 먼저 해주세요.");
+      return;
+    }
+
     await page.setCookie(...puppeteerCookies);
+    addLog(`ECFS 쿠키 설정: ${puppeteerCookies.length}개`, "info");
 
     // 페이지 이동
     const pageUrl = routing.directUrl
       ? `${ECFS_PSP_URL}?m=${routing.menuParam}&s=${routing.directUrl}`
       : `${ECFS_PSP_URL}?m=${routing.menuParam}`;
 
+    addLog(`ECFS 페이지 이동: ${pageUrl}`, "info");
     await page.goto(pageUrl, { waitUntil: "networkidle2", timeout: 30000 });
-    addLog(`ECFS 페이지 로드: ${pageUrl}`, "info");
+
+    // 로그인 리다이렉트 감지
+    const currentUrl = page.url();
+    const pageTitle = await page.title();
+    addLog(`페이지 로드 완료: URL=${currentUrl}, 타이틀=${pageTitle}`, "info");
+
+    if (currentUrl.includes("/usr/") || currentUrl.includes("login") || currentUrl.includes("USR")) {
+      sendResult(ws, userId, requestId, false, "ECFS 세션이 만료되었습니다. 인증서 로그인을 다시 해주세요.");
+      return;
+    }
 
     // WebSquare 로드 대기
-    await page.waitForFunction(
-      () => !!(window.wq || window.$w),
-      { timeout: 15000 }
-    ).catch(() => addLog("WebSquare API 로드 대기 타임아웃 (계속 진행)", "warning"));
+    const wsqReady = await waitForWebSquare(page);
+    if (!wsqReady) {
+      addLog("WebSquare API를 찾을 수 없습니다. 페이지가 정상 로드되지 않았을 수 있습니다.", "error");
+      // 페이지 상태 진단
+      await logPageDiagnostics(page);
+      sendResult(ws, userId, requestId, false, "ECFS 페이지가 정상적으로 로드되지 않았습니다. 인증서 로그인 상태를 확인하세요.");
+      return;
+    }
 
-    await delay(1000);
+    await delay(1500);
 
     // Type B 서류: 사건확인 후 다음단계 이동
     if (routing.flow === "B" && routing.routing) {
       const { p1, p2, category, docIndex } = routing.routing;
-      // 사건확인 데이터 입력 (있으면)
-      const formData = parseFormData(draftData);
       if (formData.caseLookup) {
         await fillCaseLookup(page, formData.caseLookup);
       }
-      // mvmnNxtStep 호출
       await page.evaluate(
         (p1, p2, cat, docIdx) => {
           if (typeof window.mvmnNxtStep === "function") {
@@ -101,7 +142,6 @@ async function handleEcfsTempSave(payload, ws, userId) {
         p1, p2, category, docIndex
       );
       await delay(2000);
-      // 동의 페이지 처리
       await handleConsentPage(page);
     }
 
@@ -110,24 +150,40 @@ async function handleEcfsTempSave(payload, ws, userId) {
       await handleConsentPage(page);
     }
 
-    await delay(1000);
-
-    // 폼 데이터 입력
-    const formData = parseFormData(draftData);
+    // 폼 요소가 실제로 렌더링될 때까지 대기
     const fieldsMap = getFieldsMap(docType);
-    const fillResult = await fillForm(page, docType, formData, fieldsMap);
-    const filledCount = fillResult.filledCount || 0;
-    addLog(`ECFS 폼 입력 결과: ${filledCount}개 필드 입력`, filledCount > 0 ? "info" : "warning");
+    await waitForFormElements(page, fieldsMap);
+
+    // 폼 데이터 입력 (재시도 포함)
+    let fillResult = null;
+    for (let attempt = 1; attempt <= FILL_RETRY_COUNT; attempt++) {
+      fillResult = await fillForm(page, docType, formData, fieldsMap);
+      const filledCount = fillResult.filledCount || 0;
+      addLog(`ECFS 폼 입력 시도 ${attempt}/${FILL_RETRY_COUNT}: ${filledCount}개 필드 입력${fillResult.error ? ` (오류: ${fillResult.error})` : ""}`, filledCount > 0 ? "info" : "warning");
+
+      if (filledCount > 0) break;
+
+      if (attempt < FILL_RETRY_COUNT) {
+        addLog(`폼 입력 재시도를 위해 ${FILL_RETRY_DELAY}ms 대기...`, "info");
+        await delay(FILL_RETRY_DELAY);
+      }
+    }
+
+    const filledCount = fillResult?.filledCount || 0;
 
     if (filledCount === 0) {
-      addLog("ECFS 폼 필드 입력 실패: 0개 필드 입력됨. 폼 데이터 또는 필드 매핑을 확인하세요.", "error");
-      addLog(`formData keys: ${JSON.stringify(Object.keys(formData))}`, "info");
+      addLog("ECFS 폼 필드 입력 실패: 모든 시도에서 0개 필드 입력됨", "error");
+      addLog(`formData 키: ${JSON.stringify(Object.keys(formData))}`, "info");
+      // 페이지 상태 진단
+      await logPageDiagnostics(page);
       sendResult(ws, userId, requestId, false, "ECFS 폼 필드 입력에 실패했습니다. 서류 유형 또는 폼 데이터를 확인하세요.");
       return;
     }
 
     // 임시저장 버튼 클릭
     const tmpSaveBtnId = fieldsMap.buttons.tmpSave;
+    addLog(`임시저장 버튼 클릭 시도: ${tmpSaveBtnId}`, "info");
+
     const saveClicked = await page.evaluate((btnId) => {
       const api = window.wq || window.$w;
       // WebSquare API로 버튼 클릭
@@ -135,32 +191,57 @@ async function handleEcfsTempSave(payload, ws, userId) {
         const btn = api.getComponentById(btnId);
         if (btn && typeof btn.trigger === "function") {
           btn.trigger("click");
-          return true;
+          return "websquare";
         }
       }
-      // DOM fallback
-      const el = document.querySelector(`[id$="${btnId}"]`);
-      if (el) { el.click(); return true; }
-      return false;
+      // DOM fallback - 여러 셀렉터 시도
+      const selectors = [
+        `#${btnId}`,
+        `[id$="${btnId}"]`,
+        `[id$="_${btnId}"]`,
+        `button[id*="${btnId}"]`,
+        `a[id*="${btnId}"]`,
+      ];
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el) { el.click(); return `dom:${sel}`; }
+      }
+      return null;
     }, tmpSaveBtnId);
 
     if (!saveClicked) {
+      addLog(`임시저장 버튼을 찾을 수 없음: ${tmpSaveBtnId}`, "error");
       sendResult(ws, userId, requestId, false, "임시저장 버튼을 찾을 수 없습니다.");
       return;
     }
 
+    addLog(`임시저장 버튼 클릭: ${saveClicked}`, "info");
+
     // 저장 완료 대기 및 확인 (네트워크 요청 감시)
-    addLog("임시저장 버튼 클릭 완료, ECFS 응답 대기 중...", "info");
     let saveConfirmed = false;
     try {
-      await page.waitForResponse(
-        (res) => res.url().includes(".on") && res.status() === 200,
-        { timeout: 10000 }
+      const response = await page.waitForResponse(
+        (res) => {
+          const url = res.url();
+          return (url.includes(".on") || url.includes("save") || url.includes("tmp")) && res.status() === 200;
+        },
+        { timeout: 15000 }
       );
       saveConfirmed = true;
+      addLog(`ECFS 저장 응답: ${response.url()} (${response.status()})`, "info");
     } catch {
-      addLog("ECFS 저장 응답 감지 타임아웃 (10초). 저장이 완료되었을 수 있습니다.", "warning");
+      addLog("ECFS 저장 응답 감지 타임아웃 (15초). 저장이 완료되었을 수 있습니다.", "warning");
     }
+
+    // alert/confirm 대화상자 처리
+    await delay(500);
+    try {
+      // ECFS가 저장 완료 후 alert을 띄울 수 있음
+      page.on("dialog", async (dialog) => {
+        addLog(`ECFS 대화상자: ${dialog.type()} - ${dialog.message()}`, "info");
+        await dialog.accept();
+      });
+    } catch { /* ignore */ }
 
     await delay(1000);
 
@@ -198,6 +279,142 @@ function findChromePath() {
     `${process.env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe`,
   ].filter(Boolean);
   return paths.find((p) => fs.existsSync(p)) || null;
+}
+
+/**
+ * Puppeteer stealth 설정 - headless 감지 회피
+ */
+async function applyStealthSettings(page) {
+  // navigator.webdriver 속성 제거
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    // chrome.runtime 추가 (headless에서 누락됨)
+    window.chrome = window.chrome || {};
+    window.chrome.runtime = window.chrome.runtime || {};
+    // permissions 쿼리 오버라이드
+    const origQuery = window.navigator.permissions?.query;
+    if (origQuery) {
+      window.navigator.permissions.query = (parameters) =>
+        parameters.name === "notifications"
+          ? Promise.resolve({ state: Notification.permission })
+          : origQuery(parameters);
+    }
+    // plugins 배열 비어있지 않게
+    Object.defineProperty(navigator, "plugins", {
+      get: () => [1, 2, 3, 4, 5],
+    });
+    // languages 설정
+    Object.defineProperty(navigator, "languages", {
+      get: () => ["ko-KR", "ko", "en-US", "en"],
+    });
+  });
+
+  // User-Agent 설정 (headless 흔적 제거)
+  const ua = await page.evaluate(() => navigator.userAgent);
+  await page.setUserAgent(ua.replace("HeadlessChrome", "Chrome"));
+
+  // viewport 설정
+  await page.setViewport({ width: 1280, height: 900 });
+}
+
+/**
+ * WebSquare API가 로드될 때까지 대기
+ * @returns {Promise<boolean>} WebSquare 사용 가능 여부
+ */
+async function waitForWebSquare(page) {
+  try {
+    await page.waitForFunction(
+      () => {
+        const api = window.wq || window.$w;
+        return !!(api && typeof api.getComponentById === "function");
+      },
+      { timeout: 20000 }
+    );
+    addLog("WebSquare API 로드 확인", "info");
+    return true;
+  } catch {
+    addLog("WebSquare API 로드 타임아웃 (20초)", "warning");
+    return false;
+  }
+}
+
+/**
+ * 폼 요소가 실제로 렌더링될 때까지 대기
+ */
+async function waitForFormElements(page, fieldsMap) {
+  const sampleIds = [];
+  if (fieldsMap.caseBasic?.caseName) sampleIds.push(fieldsMap.caseBasic.caseName);
+  if (fieldsMap.buttons?.tmpSave) sampleIds.push(fieldsMap.buttons.tmpSave);
+  if (fieldsMap.claimPurpose?.content) sampleIds.push(fieldsMap.claimPurpose.content);
+
+  if (sampleIds.length === 0) return;
+
+  try {
+    await page.waitForFunction(
+      (ids) => {
+        const api = window.wq || window.$w;
+        if (!api || typeof api.getComponentById !== "function") return false;
+        // 샘플 ID 중 하나라도 찾으면 폼 준비 완료로 판단
+        return ids.some((id) => {
+          const comp = api.getComponentById(id);
+          if (comp) return true;
+          const el = document.querySelector(`[id$="_${id}"], [id$="${id}"], #${id}`);
+          return !!el;
+        });
+      },
+      { timeout: 10000 },
+      sampleIds
+    );
+    addLog("폼 요소 렌더링 확인", "info");
+  } catch {
+    addLog("폼 요소 렌더링 대기 타임아웃 (10초) - 계속 진행", "warning");
+  }
+
+  await delay(500);
+}
+
+/**
+ * 페이지 상태 진단 로깅 (디버깅용)
+ */
+async function logPageDiagnostics(page) {
+  try {
+    const diag = await page.evaluate(() => {
+      const api = window.wq || window.$w;
+      const hasApi = !!(api && typeof api.getComponentById === "function");
+
+      // 페이지에 있는 주요 요소 확인
+      const forms = document.querySelectorAll("form");
+      const inputs = document.querySelectorAll("input[type='text'], textarea, select");
+      const buttons = document.querySelectorAll("button, a.btn, [role='button']");
+
+      // body의 처음 500자
+      const bodyText = (document.body?.innerText || "").substring(0, 500);
+
+      // ECFS 관련 요소 찾기
+      const wsqElements = document.querySelectorAll("[id*='ibx_'], [id*='sbx_'], [id*='txa_'], [id*='btn_']");
+      const wsqIds = Array.from(wsqElements).slice(0, 20).map((e) => e.id);
+
+      return {
+        url: location.href,
+        title: document.title,
+        hasWebSquare: hasApi,
+        formCount: forms.length,
+        inputCount: inputs.length,
+        buttonCount: buttons.length,
+        bodyPreview: bodyText,
+        wsqElementIds: wsqIds,
+      };
+    });
+
+    addLog(`[진단] URL: ${diag.url}`, "info");
+    addLog(`[진단] WebSquare: ${diag.hasWebSquare}, Forms: ${diag.formCount}, Inputs: ${diag.inputCount}, Buttons: ${diag.buttonCount}`, "info");
+    addLog(`[진단] WebSquare 요소 IDs: ${diag.wsqElementIds.join(", ") || "(없음)"}`, "info");
+    if (diag.bodyPreview) {
+      addLog(`[진단] 페이지 내용: ${diag.bodyPreview.substring(0, 200)}`, "info");
+    }
+  } catch (e) {
+    addLog(`[진단] 페이지 진단 실패: ${e.message}`, "warning");
+  }
 }
 
 /**
@@ -269,21 +486,79 @@ async function fillCaseLookup(page, lookup) {
  * 전자소송 동의 페이지 자동 처리
  */
 async function handleConsentPage(page) {
-  const hasConsent = await page.evaluate(() => {
-    const chk = document.querySelector('[id*="cbx_agre"], [id*="chk_agree"], input[id*="agre"]');
-    return !!chk;
-  });
+  // 동의 체크박스가 나타날 때까지 잠시 대기
+  let hasConsent = false;
+  for (let i = 0; i < 5; i++) {
+    hasConsent = await page.evaluate(() => {
+      const chk = document.querySelector(
+        '[id*="cbx_agre"], [id*="chk_agree"], [id*="chk_agre"], input[id*="agre"], [id*="agreAll"]'
+      );
+      return !!chk;
+    });
+    if (hasConsent) break;
+    await delay(1000);
+  }
 
   if (hasConsent) {
+    addLog("동의 페이지 감지 - 자동 동의 처리", "info");
     await page.evaluate(() => {
       // 동의 체크박스 클릭
-      const checkboxes = document.querySelectorAll('[id*="cbx_agre"] input, [id*="chk_agree"] input, input[id*="agre"]');
-      checkboxes.forEach((cb) => { cb.checked = true; cb.click(); });
-      // 동의 버튼 클릭
-      const btn = document.querySelector('[id*="btn_agre"], [id*="btn_agree"], button[id*="agre"]');
-      if (btn) btn.click();
+      const checkboxes = document.querySelectorAll(
+        '[id*="cbx_agre"] input, [id*="chk_agree"] input, [id*="chk_agre"] input, input[id*="agre"], [id*="agreAll"] input'
+      );
+      checkboxes.forEach((cb) => {
+        if (!cb.checked) { cb.checked = true; cb.click(); }
+      });
+
+      // WebSquare 체크박스도 처리
+      const api = window.wq || window.$w;
+      if (api && typeof api.getComponentById === "function") {
+        const agreIds = ["cbx_agre", "chk_agree", "chk_agre", "agreAll"];
+        agreIds.forEach((id) => {
+          const comp = api.getComponentById(id);
+          if (comp && typeof comp.setValue === "function") {
+            comp.setValue(true);
+          } else if (comp && typeof comp.check === "function") {
+            comp.check();
+          }
+        });
+      }
     });
-    await delay(2000);
+
+    await delay(500);
+
+    // 동의 버튼 클릭
+    await page.evaluate(() => {
+      const btnSelectors = [
+        '[id*="btn_agre"]', '[id*="btn_agree"]', 'button[id*="agre"]',
+        '[id*="btn_cnfm"]', '[id*="btn_next"]', '[id*="btn_nxt"]',
+      ];
+      for (const sel of btnSelectors) {
+        const btn = document.querySelector(sel);
+        if (btn) {
+          btn.click();
+          return;
+        }
+      }
+      // WebSquare 버튼도 시도
+      const api = window.wq || window.$w;
+      if (api && typeof api.getComponentById === "function") {
+        const btnIds = ["btn_agre", "btn_agree", "btn_cnfm"];
+        for (const id of btnIds) {
+          const comp = api.getComponentById(id);
+          if (comp && typeof comp.trigger === "function") {
+            comp.trigger("click");
+            return;
+          }
+        }
+      }
+    });
+
+    // 동의 후 폼 페이지 로드 대기
+    addLog("동의 처리 완료, 폼 페이지 로드 대기...", "info");
+    await delay(3000);
+  } else {
+    addLog("동의 페이지 없음 (건너뜀)", "info");
   }
 }
 
@@ -298,29 +573,60 @@ async function fillForm(page, docType, formData, fieldsMap) {
         return { filled: false, filledCount: 0, error: "WebSquare API 없음" };
       }
 
+      const log = [];
+
       function resolveComponent(shortId) {
+        // 1. 직접 ID로 조회
         let comp = api.getComponentById(shortId);
         if (comp && typeof comp.setValue === "function") return comp;
+
+        // 2. DOM에서 suffix 매치
         const el = document.querySelector(`[id$="_${shortId}"], [id$="${shortId}"]`);
         if (el && el.id) {
           comp = api.getComponentById(el.id);
           if (comp && typeof comp.setValue === "function") return comp;
         }
+
+        // 3. 정확한 ID 매치
+        const exact = document.getElementById(shortId);
+        if (exact) {
+          comp = api.getComponentById(exact.id);
+          if (comp && typeof comp.setValue === "function") return comp;
+        }
+
         return null;
       }
 
       function setVal(id, value) {
         try {
           const comp = resolveComponent(id);
-          if (comp) { comp.setValue(value); return true; }
-        } catch {}
+          if (comp) {
+            comp.setValue(value);
+            // change 이벤트 트리거 (WebSquare가 감지하도록)
+            if (typeof comp.trigger === "function") {
+              try { comp.trigger("change"); } catch { /* ignore */ }
+            }
+            log.push(`OK: ${id} = ${String(value).substring(0, 20)}`);
+            return true;
+          }
+          log.push(`MISS: ${id}`);
+        } catch (e) {
+          log.push(`ERR: ${id} - ${e.message}`);
+        }
         return false;
       }
 
       function clickRadio(id) {
         try {
-          const el = document.querySelector(`[id$="_${id}"], [id$="${id}"]`);
+          // DOM 클릭
+          const el = document.querySelector(`[id$="_${id}"], [id$="${id}"], #${id}`);
           if (el) { el.click(); return true; }
+          // WebSquare 컴포넌트
+          const comp = resolveComponent(id);
+          if (comp && typeof comp.trigger === "function") {
+            comp.trigger("click");
+            return true;
+          }
         } catch {}
         return false;
       }
@@ -330,9 +636,9 @@ async function fillForm(page, docType, formData, fieldsMap) {
       // ── 사건기본정보 ──
       if (data.caseBasic) {
         const cb = fields.caseBasic;
-        if (data.caseBasic.caseName && setVal(cb.caseName, data.caseBasic.caseName)) filledCount++;
-        if (data.caseBasic.courtName && setVal(cb.court, data.caseBasic.courtName)) filledCount++;
-        if (data.caseBasic.claimAmount && setVal(cb.claimAmount, String(data.caseBasic.claimAmount))) filledCount++;
+        if (data.caseBasic.caseName && cb.caseName && setVal(cb.caseName, data.caseBasic.caseName)) filledCount++;
+        if (data.caseBasic.courtName && cb.court && setVal(cb.court, data.caseBasic.courtName)) filledCount++;
+        if (data.caseBasic.claimAmount && cb.claimAmount && setVal(cb.claimAmount, String(data.caseBasic.claimAmount))) filledCount++;
 
         if (cb.claimDiv_property) {
           if (data.caseBasic.claimDivision === "property") clickRadio(cb.claimDiv_property);
@@ -401,25 +707,25 @@ async function fillForm(page, docType, formData, fieldsMap) {
 
       // ── 청구취지 ──
       if (data.content && data.content.claimPurpose) {
-        setVal(fields.claimPurpose.content, data.content.claimPurpose);
-        filledCount++;
+        if (setVal(fields.claimPurpose.content, data.content.claimPurpose)) {
+          filledCount++;
+        }
       }
 
       // ── 청구원인 ──
       if (data.content && data.content.claimReason) {
         clickRadio(fields.claimReason.directInput);
-        const editorFrame = document.querySelector('iframe[id*="clmCas"], iframe[id*="aplyIntntResn"]');
+        const editorFrame = document.querySelector('iframe[id*="clmCas"], iframe[id*="aplyIntntResn"], iframe[id*="aplyResn"]');
         if (editorFrame && editorFrame.contentDocument) {
           const body = editorFrame.contentDocument.body;
-          if (body) body.innerHTML = data.content.claimReason;
+          if (body) { body.innerHTML = data.content.claimReason; filledCount++; }
         } else {
-          const textarea = document.querySelector('[id*="clmCas"] textarea, [id*="aplyIntntResn"] textarea');
-          if (textarea) textarea.value = data.content.claimReason;
+          const textarea = document.querySelector('[id*="clmCas"] textarea, [id*="aplyIntntResn"] textarea, [id*="aplyResn"] textarea');
+          if (textarea) { textarea.value = data.content.claimReason; filledCount++; }
         }
-        filledCount++;
       }
 
-      return { filled: filledCount > 0, filledCount };
+      return { filled: filledCount > 0, filledCount, log };
     },
     formData,
     fieldsMap,
