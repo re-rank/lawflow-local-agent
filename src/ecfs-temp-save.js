@@ -116,7 +116,15 @@ async function handleEcfsTempSave(payload, ws, userId) {
     const formData = parseFormData(draftData);
     const fieldsMap = getFieldsMap(docType);
     const fillResult = await fillForm(page, docType, formData, fieldsMap);
-    addLog(`ECFS 폼 입력 완료: ${fillResult.filledCount || 0}개 필드`, "info");
+    const filledCount = fillResult.filledCount || 0;
+    addLog(`ECFS 폼 입력 결과: ${filledCount}개 필드 입력`, filledCount > 0 ? "info" : "warning");
+
+    if (filledCount === 0) {
+      addLog("ECFS 폼 필드 입력 실패: 0개 필드 입력됨. 폼 데이터 또는 필드 매핑을 확인하세요.", "error");
+      addLog(`formData keys: ${JSON.stringify(Object.keys(formData))}`, "info");
+      sendResult(ws, userId, requestId, false, "ECFS 폼 필드 입력에 실패했습니다. 서류 유형 또는 폼 데이터를 확인하세요.");
+      return;
+    }
 
     // 임시저장 버튼 클릭
     const tmpSaveBtnId = fieldsMap.buttons.tmpSave;
@@ -141,10 +149,22 @@ async function handleEcfsTempSave(payload, ws, userId) {
       return;
     }
 
-    // 저장 완료 대기
-    await delay(3000);
+    // 저장 완료 대기 및 확인 (네트워크 요청 감시)
+    addLog("임시저장 버튼 클릭 완료, ECFS 응답 대기 중...", "info");
+    let saveConfirmed = false;
+    try {
+      await page.waitForResponse(
+        (res) => res.url().includes(".on") && res.status() === 200,
+        { timeout: 10000 }
+      );
+      saveConfirmed = true;
+    } catch {
+      addLog("ECFS 저장 응답 감지 타임아웃 (10초). 저장이 완료되었을 수 있습니다.", "warning");
+    }
 
-    addLog("ECFS 임시저장 완료", "success");
+    await delay(1000);
+
+    addLog(`ECFS 임시저장 ${saveConfirmed ? "확인됨" : "완료 (응답 미확인)"}`, saveConfirmed ? "success" : "warning");
     sendResult(ws, userId, requestId, true, null);
   } catch (err) {
     addLog(`ECFS 임시저장 오류: ${err.message}`, "error");
