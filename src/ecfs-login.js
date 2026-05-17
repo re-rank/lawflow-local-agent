@@ -1,20 +1,15 @@
 /**
  * ecfs-login.js
- * 전자소송(ECFS) 포털 인증서 자동 로그인 처리
+ * 전자소송(ECFS) 포털 인증서 로그인 처리
  *
- * 전략 (v3 - AnySign4PC 완전 우회):
- * 1. puppeteer-core headless로 ECFS 로그인 페이지 접속
- * 2. 서버 인증서를 페이지에서 가져옴 (pspsoltn.SVR_CERT 또는 직접 조회)
- * 3. Node.js에서 CMS 서명(signVal) + VID 봉투(encVid) 생성 (ecfs-crypto.js)
- * 4. WebSquare DataMap에 값을 직접 설정하고 submission 실행
- * 5. 로그인 성공 시 세션 쿠키 추출 → 서버로 반환
+ * 전략 (v4 - AnySign4PC 활용):
+ * 1. puppeteer-core로 Chrome을 headed(화면 표시) 모드로 실행
+ * 2. ECFS 로그인 페이지 접속 후 인증서로그인 버튼 자동 클릭
+ * 3. AnySign4PC가 팝업되면 사용자가 직접 인증서 선택 + 비밀번호 입력
+ * 4. 로그인 성공 후 세션 쿠키 자동 추출 → 서버로 반환
  *
- * AnySign4PC(wss://localhost:10531)와의 WebSocket 통신을 완전히 생략하므로
- * 사용자 PC에 AnySign4PC가 없어도 동작합니다.
- *
- * NOTE: CloakBrowser는 봇 탐지 우회용 패치 Chromium이라 Windows에서 headless를
- * 지원하지 않음. ECFS는 정부 사이트로 봇 탐지가 없으므로 puppeteer-core +
- * 시스템 Chrome을 사용하여 완전한 headless 실행을 보장합니다.
+ * AnySign4PC가 사용자 PC에 설치되어 있어야 합니다.
+ * (ECFS 사이트에서 자동 설치 안내)
  */
 
 const fs = require("fs");
@@ -22,8 +17,6 @@ const path = require("path");
 const WebSocket = require("ws");
 const state = require("./state");
 const { send, addLog } = require("./utils");
-const { loadConfig } = require("./config");
-const { createCmsSignedData, createVidEnvelope } = require("./ecfs-crypto");
 
 /** 시스템 Chrome 경로 탐색 (Windows) */
 function _findChromePath() {
@@ -47,8 +40,8 @@ function _findChromePath() {
 const ECFS_LOGIN_URL =
   "https://ecfs.scourt.go.kr/psp/index.on?m=PSP101M01";
 
-/** 로그인 완료 대기 타임아웃 */
-const LOGIN_TIMEOUT_MS = 90_000;
+/** 로그인 완료 대기 타임아웃 (사용자가 직접 인증서 선택하므로 넉넉하게) */
+const LOGIN_TIMEOUT_MS = 180_000;
 
 /** 중복 로그인 방지 플래그 */
 let _loginInProgress = false;
@@ -59,15 +52,16 @@ let _loginInProgress = false;
 
 /**
  * 서버에서 수신한 ecfs_login 메시지를 처리합니다.
+ * headed Chrome을 열고 사용자가 AnySign4PC로 직접 인증서 로그인하면
+ * 세션 쿠키를 자동 추출하여 서버에 전송합니다.
+ *
  * @param {object} payload - { requestId, userId }
  */
 async function handleEcfsLogin(payload) {
   const { requestId } = payload;
 
-  // 수신 payload 전체 로깅 (디버깅)
   addLog(`ECFS 로그인 payload: ${JSON.stringify(payload).substring(0, 300)}`, "info");
 
-  // 중복 실행 방지
   if (_loginInProgress) {
     addLog("이전 로그인이 진행 중입니다. 요청 무시.", "warning");
     _sendResult(requestId, false, null, null, "이전 로그인이 진행 중입니다.");
@@ -78,46 +72,10 @@ async function handleEcfsLogin(payload) {
   let browser = null;
 
   try {
-    // 인증서 사전 검증
-    if (!state.certPath || !state.certPassword) {
-      addLog("인증서가 설정되지 않았습니다.", "error");
-      _sendResult(
-        requestId, false, null, null,
-        "인증서가 설정되지 않았습니다. 에이전트에서 인증서를 먼저 선택하세요."
-      );
-      send("agent:efiling-status", { status: "error", error: "인증서 미설정" });
-      return;
-    }
+    addLog("전자소송 인증서 로그인 시작 (AnySign4PC 모드)...", "info");
+    send("agent:efiling-status", { status: "processing", step: "ECFS 로그인 준비" });
 
-    if (!state.certKeyPath) {
-      addLog("개인키 파일이 설정되지 않았습니다.", "error");
-      _sendResult(requestId, false, null, null, "개인키 파일(signPri.key)이 없습니다.");
-      send("agent:efiling-status", { status: "error", error: "개인키 미설정" });
-      return;
-    }
-
-    addLog(`인증서: ${state.certPath}`, "info");
-    addLog(`개인키: ${state.certKeyPath}`, "info");
-    addLog("전자소송 인증서 자동 로그인 시작...", "info");
-    send("agent:efiling-status", { status: "processing", step: "ECFS 자동 로그인" });
-
-    // CMS 서명 사전 테스트 (인증서/비밀번호 유효성 검증)
-    addLog("인증서 유효성 검증 중...", "info");
-    try {
-      createCmsSignedData("TEST");
-      addLog("인증서 유효성 검증 통과", "success");
-    } catch (cryptoErr) {
-      addLog(`인증서 암호화 실패: ${cryptoErr.message}`, "error");
-      addLog(`스택: ${cryptoErr.stack?.substring(0, 500)}`, "error");
-      _sendResult(
-        requestId, false, null, null,
-        `인증서 또는 비밀번호가 올바르지 않습니다: ${cryptoErr.message}`
-      );
-      send("agent:efiling-status", { status: "error", error: "인증서 검증 실패" });
-      return;
-    }
-
-    // puppeteer-core + 시스템 Chrome (완전 headless)
+    // ── Chrome 실행 (headed) ──
     const chromePath = _findChromePath();
     if (!chromePath) {
       const err = "Chrome 또는 Edge 브라우저를 찾을 수 없습니다. Chrome을 설치하세요.";
@@ -127,20 +85,18 @@ async function handleEcfsLogin(payload) {
       return;
     }
 
-    addLog(`브라우저 실행 중 (headless): ${chromePath}`, "info");
+    addLog(`브라우저 실행 (headed): ${chromePath}`, "info");
     const puppeteer = await import("puppeteer-core");
 
     browser = await puppeteer.default.launch({
       executablePath: chromePath,
-      headless: "new",
+      headless: false,
       args: [
         "--no-sandbox",
         "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-extensions",
       ],
     });
-    addLog("브라우저 실행 완료 (headless)", "success");
+    addLog("브라우저 실행 완료 (headed)", "success");
 
     const page = await browser.newPage();
 
@@ -156,45 +112,15 @@ async function handleEcfsLogin(payload) {
       addLog(`[페이지에러] ${err.message.substring(0, 150)}`, "error");
     });
 
+    // ECFS 다이얼로그(alert) 메시지 캡처 (에러 메시지 포착용)
+    let lastDialogMessage = "";
     page.on("dialog", async (dialog) => {
+      lastDialogMessage = dialog.message();
       addLog(
-        `[다이얼로그 ${dialog.type()}] ${dialog.message().substring(0, 100)}`,
+        `[다이얼로그 ${dialog.type()}] ${lastDialogMessage.substring(0, 100)}`,
         "info"
       );
-      await dialog.dismiss();
-    });
-
-    // ── 네트워크 인터셉트: AnySign4PC localhost 요청 차단 ──
-    await page.setRequestInterception(true);
-    page.on("request", (req) => {
-      const url = req.url();
-      if (/^(wss?|https?):\/\/(127\.0\.0\.1|localhost)(:\d+)?/i.test(url)) {
-        addLog(`[차단] localhost 요청: ${url.substring(0, 80)}`, "info");
-        if (req.method() === "OPTIONS") {
-          req.respond({
-            status: 200,
-            headers: {
-              "Access-Control-Allow-Origin": "*",
-              "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-              "Access-Control-Allow-Headers": "*",
-            },
-          });
-        } else {
-          req.respond({
-            status: 200,
-            contentType: "application/json",
-            headers: { "Access-Control-Allow-Origin": "*" },
-            body: JSON.stringify({
-              result: 0,
-              code: "0000",
-              message: "success",
-              status: "ready",
-            }),
-          });
-        }
-      } else {
-        req.continue();
-      }
+      await dialog.accept();
     });
 
     // ── ECFS 로그인 페이지 접속 ──
@@ -221,292 +147,69 @@ async function handleEcfsLogin(payload) {
       addLog("WebSquare 콘텐츠 로드 대기 초과, 계속 진행...", "warning");
     }
 
-    // onpageload 완료 대기 (서버 인증서 조회 등)
-    await new Promise((r) => setTimeout(r, 8_000));
+    // 페이지 완전 렌더링 대기
+    await new Promise((r) => setTimeout(r, 3_000));
 
-    // ── WebSquare 객체 존재 확인 ──
-    const scopeCheck = await page.evaluate(() => ({
-      hasScwin: !!window.mf_pfwork_scwin,
-      hasDma: !!window.mf_pfwork_dma_certparam,
-      hasSbm: !!window.mf_pfwork_sbm_certlogin,
-      hasInput: !!window.mf_pfwork_ibx_elpUserIdForCert,
-      hasSvrCert: !!(window.mf_pfwork_scwin && window.mf_pfwork_scwin._svr_cert),
-      pageUrl: location.href,
-      bodyLen: document.body ? document.body.innerText.length : 0,
-    }));
+    // ── 인증서 로그인 버튼 자동 클릭 ──
+    addLog("인증서 로그인 버튼 클릭 시도...", "info");
+    send("agent:efiling-status", { status: "processing", step: "인증서 로그인 버튼 클릭" });
 
-    addLog(`WebSquare 스코프: scwin=${scopeCheck.hasScwin} dma=${scopeCheck.hasDma} sbm=${scopeCheck.hasSbm} input=${scopeCheck.hasInput} svrCert=${scopeCheck.hasSvrCert}`, "info");
-    addLog(`페이지: ${scopeCheck.pageUrl} (본문길이: ${scopeCheck.bodyLen})`, "info");
+    const clicked = await _clickCertLoginButton(page);
 
-    // ── Step 1: 서버 인증서 추출 (브라우저에서) ──
-    addLog("서버 인증서 확보 중...", "info");
-    send("agent:efiling-status", { status: "processing", step: "서버 인증서 확보" });
-
-    const svrCertResult = await page.evaluate(async () => {
-      const log = [];
-      const scwin = window.mf_pfwork_scwin;
-
-      if (!scwin) return { svrCert: null, error: "scwin 객체를 찾을 수 없습니다 (WebSquare 로드 실패)", log };
-
-      let svrCert = null;
-
-      // 방법 1: scwin._svr_cert
-      try {
-        svrCert = scwin._svr_cert;
-        if (svrCert) log.push("서버인증서: scwin._svr_cert 사용");
-      } catch (e) {
-        log.push("scwin._svr_cert 접근 실패: " + e.message);
-      }
-
-      // 방법 2: pspsoltn.SVR_CERT
-      if (!svrCert) {
-        try {
-          if (typeof pspsoltn !== "undefined" && pspsoltn.SVR_CERT) {
-            svrCert = pspsoltn.SVR_CERT;
-            log.push("서버인증서: pspsoltn.SVR_CERT 사용");
-          }
-        } catch (e) {
-          log.push("pspsoltn.SVR_CERT 접근 실패: " + e.message);
-        }
-      }
-
-      // 방법 3: API 직접 조회
-      if (!svrCert) {
-        log.push("서버 인증서 직접 조회 시도...");
-        try {
-          const resp = await fetch("/psp/psp001/svrcert.on", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ dma_null: {} }),
-          });
-          const data = await resp.json();
-          if (data?.data?.dma_svrcert?.respCode === "00") {
-            eval(data.data.dma_svrcert.svrcert);
-            svrCert = typeof svrcert !== "undefined" ? svrcert : null;
-            log.push("서버인증서: 직접 조회 성공");
-          } else {
-            log.push("서버인증서 조회 응답: " + JSON.stringify(data?.data?.dma_svrcert));
-          }
-        } catch (e) {
-          log.push("서버인증서 조회 실패: " + e.message);
-        }
-      }
-
-      if (svrCert) log.push("서버인증서 확보 (길이: " + String(svrCert).length + ")");
-      return { svrCert, log };
-    });
-
-    // 서버 인증서 추출 로그
-    if (svrCertResult.log) {
-      svrCertResult.log.forEach((l) => addLog(`  [인증서] ${l}`, "info"));
-    }
-
-    if (!svrCertResult.svrCert) {
-      const errMsg = svrCertResult.error || "서버 인증서를 조회할 수 없습니다.";
-      addLog(`서버 인증서 확보 실패: ${errMsg}`, "error");
-      _sendResult(requestId, false, null, null, errMsg);
-      send("agent:efiling-status", { status: "error", error: errMsg });
-      await browser.close().catch(() => {});
-      return;
-    }
-
-    // ── Step 2: Node.js에서 CMS 서명 + VID 봉투 생성 ──
-    addLog("CMS 서명 + VID 봉투 생성 중...", "info");
-    send("agent:efiling-status", { status: "processing", step: "인증서 서명 생성" });
-
-    let signVal, encVid;
-    try {
-      signVal = createCmsSignedData("SCMAIN");
-      addLog(`CMS 서명 완료 (길이: ${signVal.length})`, "success");
-    } catch (cmsErr) {
-      addLog(`CMS 서명 실패: ${cmsErr.message}`, "error");
-      _sendResult(requestId, false, null, null, `CMS 서명 실패: ${cmsErr.message}`);
-      send("agent:efiling-status", { status: "error", error: "CMS 서명 실패" });
-      await browser.close().catch(() => {});
-      return;
-    }
-
-    try {
-      encVid = createVidEnvelope(String(svrCertResult.svrCert));
-      addLog(`VID 봉투 완료 (길이: ${encVid.length})`, "success");
-    } catch (vidErr) {
-      addLog(`VID 봉투 실패: ${vidErr.message}`, "error");
-      _sendResult(requestId, false, null, null, `VID 봉투 실패: ${vidErr.message}`);
-      send("agent:efiling-status", { status: "error", error: "VID 봉투 실패" });
-      await browser.close().catch(() => {});
-      return;
-    }
-
-    // ── Step 3: DataMap 주입 + 로그인 submission 실행 ──
-    addLog("로그인 데이터 주입 및 제출...", "info");
-    send("agent:efiling-status", { status: "processing", step: "로그인 실행" });
-
-    // ECFS 사용자 ID: payload에서 제공되면 사용, 없으면 config의 email(실제 로그인 아이디) 사용
-    const cfg = loadConfig();
-    const ecfsUserId = payload.ecfsUserId || payload.loginId || cfg.email || state.userId || "";
-    addLog(`ECFS 사용자ID: "${ecfsUserId}" (config.email: ${cfg.email || "없음"})`, "info");
-
-    // submission HTTP 요청 모니터링
-    let submissionRequestSent = false;
-    let submissionResponseReceived = false;
-    let submissionUrl = "";
-    page.on("response", (res) => {
-      const url = res.url();
-      if (url.includes("certlogin") || url.includes("psp001") || url.includes("login")) {
-        submissionResponseReceived = true;
-        submissionUrl = url;
-        addLog(`[응답] ${res.status()} ${url.substring(0, 100)}`, "info");
-      }
-    });
-
-    const execResult = await page.evaluate(async (userId, signValArg, encVidArg) => {
-      const log = [];
-
-      try {
-        // Submission URL 확보
-        const actionUrl = "/psp/psp001/certlogin.on";
-
-        // 요청 데이터 구성 (WebSquare DataMap 포맷)
-        const clientTime = new Date().toISOString().replace("T", " ").split(".")[0];
-        let uuid;
-        try { uuid = crypto.randomUUID(); } catch { uuid = String(Date.now()); }
-
-        const requestBody = {
-          dma_certparam: {
-            elpUserId: userId.trim(),
-            signVal: signValArg,
-            encVid: encVidArg,
-            loginType: "P",
-            clientTime: String(new Date().getTime()),
-            apiKey: "",
-            rtnUrl: "",
-            uuid: uuid,
-          }
-        };
-
-        log.push(`직접 POST: ${actionUrl} (userId: ${userId.trim()})`);
-
-        // SC-* 커스텀 헤더 (preSubmitFunction이 설정하는 헤더)
-        const resp = await fetch(actionUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "SC-Userid": "anonymous",
-            "SC-Traceid": "PSP101M01@anonymous",
-            "SC-Pgmid": "PSP101M01",
-          },
-          body: JSON.stringify(requestBody),
-          credentials: "include",
-        });
-
-        log.push(`응답: ${resp.status}`);
-
-        if (!resp.ok) {
-          const errText = await resp.text().catch(() => "");
-          return {
-            phase: "http",
-            success: false,
-            error: `HTTP ${resp.status}: ${errText.substring(0, 200)}`,
-            log,
-          };
-        }
-
-        const respData = await resp.json();
-        log.push(`결과: ${JSON.stringify(respData).substring(0, 300)}`);
-
-        window.__ecfsLoginResult = respData;
-        window.__ecfsLoginError = null;
-
-        return { phase: "submitted", success: true, log };
-      } catch (err) {
-        return { phase: "fetch", success: false, error: err.message, log };
-      }
-    }, ecfsUserId, signVal, encVid);
-
-    // 실행 결과 로깅
-    if (execResult.log) {
-      execResult.log.forEach((l) => addLog(`  [로그인] ${l}`, "info"));
-    }
-
-    if (!execResult.success) {
-      const execLogs = (execResult.log || []).join(" → ");
-      addLog(`로그인 실행 실패 (${execResult.phase}): ${execResult.error}`, "error");
-      _sendResult(requestId, false, null, null, `[${execResult.phase}] ${execResult.error} (${execLogs})`);
-      send("agent:efiling-status", { status: "error", error: execResult.error });
-      await browser.close().catch(() => {});
-      return;
-    }
-
-    // ── 로그인 결과 대기 ──
-    const execLogs = (execResult.log || []).join(" → ");
-    addLog(`로그인 실행 성공: ${execLogs}`, "info");
-
-    // 직접 fetch 방식에서는 결과가 즉시 저장됨 (waitForFunction 불필요)
-    // 만약 결과가 아직 없으면 짧은 대기
-    try {
-      await page.waitForFunction(
-        () => window.__ecfsLoginResult !== null || window.__ecfsLoginError !== null,
-        { timeout: 10_000 }
-      );
-    } catch {
-      addLog("로그인 응답 대기 시간 초과 (10초)", "error");
-      _sendResult(requestId, false, null, null, "로그인 응답을 받지 못했습니다.");
-      send("agent:efiling-status", { status: "error", error: "응답 대기 시간 초과" });
-      await browser.close().catch(() => {});
-      return;
-    }
-
-    // ── 로그인 결과 처리 ──
-    const loginResult = await page.evaluate(() => ({
-      result: window.__ecfsLoginResult,
-      error: window.__ecfsLoginError,
-    }));
-
-    if (loginResult.error) {
-      addLog(`로그인 에러: ${loginResult.error}`, "error");
-      _sendResult(requestId, false, null, null, loginResult.error);
-      send("agent:efiling-status", { status: "error", error: loginResult.error });
-      await browser.close().catch(() => {});
-      return;
-    }
-
-    const serverResp = loginResult.result;
-    addLog(`서버 응답: ${JSON.stringify(serverResp).substring(0, 300)}`, "info");
-
-    // WebSquare 응답 형식: { data: { dma_certparam: { respCode, respMesg } } }
-    // 또는 직접 형식:     { data: { respCode, respMesg } }
-    // 또는 플랫 형식:     { dma_certparam: { respCode, respMesg } }
-    const d = serverResp?.data?.dma_certparam
-           || serverResp?.data
-           || serverResp?.dma_certparam
-           || serverResp
-           || {};
-    const respCode = d.respCode;
-    const respMesg = d.respMesg || d.errMsg || "";
-
-    if (respCode === "00") {
-      // 로그인 성공
-      addLog("ECFS 로그인 성공!", "success");
-
-      // 세션 안정화 대기 (processCertLoginDone 내부 처리 완료)
-      await new Promise((r) => setTimeout(r, 2_000));
-
-      const cookies = await _extractCookies(page);
-      const userName = await _extractUserName(page);
-
-      _sendResult(requestId, true, cookies, userName, null);
-      addLog(
-        `쿠키 ${cookies.length}개 추출${userName ? ` (${userName})` : ""}`,
-        "success"
-      );
-      send("agent:efiling-status", { status: "completed", step: "로그인 완료" });
+    if (clicked.success) {
+      addLog(`인증서 로그인 버튼 클릭 성공: ${clicked.method}`, "success");
     } else {
-      // 로그인 실패 (서버에서 거부)
-      addLog(`로그인 거부: [${respCode}] ${respMesg}`, "error");
-      _sendResult(requestId, false, null, null, `서버 응답: ${respMesg}`);
-      send("agent:efiling-status", { status: "error", error: respMesg });
+      addLog("인증서 로그인 버튼 자동 클릭 실패. 사용자가 직접 클릭해주세요.", "warning");
     }
+
+    // ── AnySign4PC 인증서 선택 대기 ──
+    send("agent:efiling-status", {
+      status: "processing",
+      step: "인증서 선택 대기 중 (AnySign4PC)",
+    });
+    addLog(
+      "AnySign4PC 인증서 선택 대기 중... 사용자가 인증서를 선택하고 비밀번호를 입력하세요.",
+      "info"
+    );
+
+    // 초기 쿠키 스냅샷 (로그인 전 상태)
+    const initialCookies = await page.cookies();
+    const initialCookieNames = new Set(
+      initialCookies
+        .filter((c) => c.domain.includes("scourt.go.kr"))
+        .map((c) => c.name)
+    );
+
+    // ── 로그인 성공 대기 (폴링) ──
+    const loginResult = await _waitForLoginCompletion(
+      page,
+      initialCookieNames,
+      LOGIN_TIMEOUT_MS
+    );
+
+    if (!loginResult.success) {
+      const errorMsg = lastDialogMessage || loginResult.error;
+      addLog(`로그인 실패: ${errorMsg}`, "error");
+      _sendResult(requestId, false, null, null, errorMsg);
+      send("agent:efiling-status", { status: "error", error: errorMsg });
+      await browser.close().catch(() => {});
+      return;
+    }
+
+    addLog(`ECFS 로그인 성공 감지! (${loginResult.method})`, "success");
+
+    // 세션 안정화 대기
+    await new Promise((r) => setTimeout(r, 2_000));
+
+    const cookies = await _extractCookies(page);
+    const userName = await _extractUserName(page);
+
+    _sendResult(requestId, true, cookies, userName, null);
+    addLog(
+      `쿠키 ${cookies.length}개 추출${userName ? ` (${userName})` : ""}`,
+      "success"
+    );
+    send("agent:efiling-status", { status: "completed", step: "로그인 완료" });
 
     await browser.close().catch(() => {});
   } catch (err) {
@@ -527,6 +230,138 @@ async function handleEcfsLogin(payload) {
 // ─────────────────────────────────────────────────────────
 // 헬퍼 함수
 // ─────────────────────────────────────────────────────────
+
+/**
+ * ECFS 로그인 페이지에서 인증서 로그인 버튼을 클릭합니다.
+ * 여러 방법을 시도하여 가장 먼저 성공하는 방법을 사용합니다.
+ *
+ * @param {import('puppeteer-core').Page} page
+ * @returns {Promise<{success: boolean, method: string}>}
+ */
+async function _clickCertLoginButton(page) {
+  return page.evaluate(() => {
+    // 방법 1: WebSquare 함수 직접 호출
+    try {
+      if (typeof mf_pfwork_scwin !== "undefined" && mf_pfwork_scwin.btn_certLogin_onclick) {
+        mf_pfwork_scwin.btn_certLogin_onclick();
+        return { success: true, method: "scwin.btn_certLogin_onclick()" };
+      }
+    } catch (e) { /* fall through */ }
+
+    // 방법 2: 버튼 텍스트로 탐색
+    const allClickables = document.querySelectorAll(
+      "button, a, [role='button'], input[type='button'], span[class*='btn'], div[class*='btn']"
+    );
+    for (const el of allClickables) {
+      const text = (el.textContent || el.value || "").trim();
+      if (text.includes("인증서") && (text.includes("로그인") || text.includes("Login"))) {
+        el.click();
+        return { success: true, method: `텍스트 클릭: "${text}"` };
+      }
+    }
+
+    // 방법 3: WebSquare 버튼 ID 패턴
+    const idCandidates = [
+      "mf_pfwork_btn_certLogin",
+      "btn_certLogin",
+      "mf_pfwork_btn_cert",
+      "mf_pfwork_btn_certlogin",
+    ];
+    for (const id of idCandidates) {
+      const el = document.getElementById(id);
+      if (el) {
+        el.click();
+        return { success: true, method: `ID 클릭: #${id}` };
+      }
+    }
+
+    return { success: false, method: "버튼을 찾을 수 없음" };
+  });
+}
+
+/**
+ * 로그인 성공 완료를 폴링으로 대기합니다.
+ * URL 변경, 쿠키 변화, DOM 변화를 1초 간격으로 체크합니다.
+ *
+ * @param {import('puppeteer-core').Page} page
+ * @param {Set<string>} initialCookieNames - 로그인 전 쿠키 이름 집합
+ * @param {number} timeoutMs
+ * @returns {Promise<{success: boolean, method?: string, error?: string}>}
+ */
+async function _waitForLoginCompletion(page, initialCookieNames, timeoutMs) {
+  const startUrl = page.url();
+  const startTime = Date.now();
+  const CHECK_INTERVAL = 1_500;
+
+  while (Date.now() - startTime < timeoutMs) {
+    await new Promise((r) => setTimeout(r, CHECK_INTERVAL));
+
+    // 브라우저 연결 확인
+    try {
+      if (!page.browser().isConnected()) {
+        return { success: false, error: "브라우저가 닫혔습니다." };
+      }
+    } catch {
+      return { success: false, error: "브라우저 연결이 끊어졌습니다." };
+    }
+
+    try {
+      // 체크 1: URL 변경 (로그인 후 메인 페이지로 이동)
+      const currentUrl = page.url();
+      if (currentUrl !== startUrl && !currentUrl.includes("PSP101M01")) {
+        return { success: true, method: `URL 변경: ${currentUrl.substring(0, 80)}` };
+      }
+
+      // 체크 2: 새로운 세션 쿠키 출현
+      const currentCookies = await page.cookies();
+      const scourtCookies = currentCookies.filter((c) =>
+        c.domain.includes("scourt.go.kr")
+      );
+      const newCookies = scourtCookies.filter(
+        (c) => !initialCookieNames.has(c.name)
+      );
+      if (newCookies.length > 0) {
+        const names = newCookies.map((c) => c.name).join(", ");
+        addLog(`새 쿠키 감지: ${names}`, "info");
+        return { success: true, method: `새 쿠키: ${names}` };
+      }
+
+      // 체크 3: DOM에서 로그인 상태 감지
+      const loggedIn = await page.evaluate(() => {
+        // 로그아웃 버튼/링크가 보이면 로그인 성공
+        const logoutEls = document.querySelectorAll(
+          "[class*='logout'], [id*='logout'], [onclick*='logout'], [href*='logout']"
+        );
+        for (const el of logoutEls) {
+          if (el.offsetWidth > 0 || el.offsetHeight > 0) return "logout_button";
+        }
+
+        // 사용자 이름 표시 영역
+        const userSelectors = [
+          "[class*='user_name']", "[class*='user_nm']",
+          "[id*='userNm']", "[id*='userName']",
+          ".login_info", "[class*='gnb_login'] span",
+        ];
+        for (const sel of userSelectors) {
+          const el = document.querySelector(sel);
+          const text = el?.textContent?.trim();
+          if (text && text.length > 1 && text !== "환영합니다") return "user_name";
+        }
+
+        return null;
+      });
+
+      if (loggedIn) {
+        return { success: true, method: `DOM 감지: ${loggedIn}` };
+      }
+    } catch (err) {
+      // 페이지 네비게이션 중 evaluate 실패 가능 → 무시
+      addLog(`로그인 체크 오류 (무시): ${err.message.substring(0, 60)}`, "info");
+    }
+  }
+
+  return { success: false, error: "로그인 대기 시간 초과 (3분). 인증서 로그인을 완료해주세요." };
+}
 
 /**
  * 세션 쿠키 추출 (scourt.go.kr 도메인)
