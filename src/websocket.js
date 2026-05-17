@@ -10,6 +10,7 @@ const { updateTray } = require("./tray");
 const { handleSignRequest } = require("./signing");
 const { handleEfilingSubmit } = require("./efiling-submit");
 const { handleEcfsLogin } = require("./ecfs-login");
+const { handleEcfsApiRequest } = require("./ecfs-api-proxy");
 
 /**
  * WebSocket을 통해 서버에 연결합니다.
@@ -125,6 +126,9 @@ function _onMessage(raw) {
       handleEcfsLogin(msg.payload || msg).catch((e) =>
         addLog(`ECFS 로그인 처리 오류: ${e.message}`, "error")
       );
+    } else if (msg.type === "ecfs_api_request") {
+      addLog("ECFS API 프록시 요청 수신", "info");
+      handleEcfsApiRequest(msg.payload || msg, state.ws, String(state.userId));
     } else if (msg.type === "efiling_submit") {
       addLog(`전자소송 제출 요청 수신 (초안 #${msg.draftId})`, "info");
       handleEfilingSubmit(msg);
