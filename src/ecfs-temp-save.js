@@ -161,6 +161,11 @@ async function handleEcfsTempSave(payload, ws, userId) {
       const filledCount = fillResult.filledCount || 0;
       addLog(`ECFS 폼 입력 시도 ${attempt}/${FILL_RETRY_COUNT}: ${filledCount}개 필드 입력${fillResult.error ? ` (오류: ${fillResult.error})` : ""}`, filledCount > 0 ? "info" : "warning");
 
+      // fillForm 내부 로그 출력 (어떤 필드가 성공/실패했는지 상세 확인)
+      if (fillResult.log && fillResult.log.length > 0) {
+        addLog(`폼 입력 상세: ${fillResult.log.join(" | ")}`, "info");
+      }
+
       if (filledCount > 0) break;
 
       if (attempt < FILL_RETRY_COUNT) {
@@ -180,7 +185,18 @@ async function handleEcfsTempSave(payload, ws, userId) {
       return;
     }
 
-    // 임시저장 버튼 클릭
+    // ── 임시저장 실행 ──
+
+    // [FIX] dialog 핸들러를 저장 버튼 클릭 *전*에 등록
+    // ECFS는 저장 시 "임시저장 하시겠습니까?" confirm을 띄울 수 있음
+    let dialogMessages = [];
+    page.on("dialog", async (dialog) => {
+      const msg = dialog.message();
+      addLog(`ECFS 대화상자: ${dialog.type()} - ${msg}`, "info");
+      dialogMessages.push(msg);
+      await dialog.accept();
+    });
+
     const tmpSaveBtnId = fieldsMap.buttons.tmpSave;
     addLog(`임시저장 버튼 클릭 시도: ${tmpSaveBtnId}`, "info");
 
@@ -211,42 +227,87 @@ async function handleEcfsTempSave(payload, ws, userId) {
 
     if (!saveClicked) {
       addLog(`임시저장 버튼을 찾을 수 없음: ${tmpSaveBtnId}`, "error");
+      await logPageDiagnostics(page);
       sendResult(ws, userId, requestId, false, "임시저장 버튼을 찾을 수 없습니다.");
       return;
     }
 
     addLog(`임시저장 버튼 클릭: ${saveClicked}`, "info");
 
-    // 저장 완료 대기 및 확인 (네트워크 요청 감시)
+    // [FIX] 저장 응답 감시 - 더 구체적인 URL 필터 + 응답 본문 검증
     let saveConfirmed = false;
+    let saveResponseBody = null;
     try {
       const response = await page.waitForResponse(
         (res) => {
           const url = res.url();
-          return (url.includes(".on") || url.includes("save") || url.includes("tmp")) && res.status() === 200;
+          // 임시저장 관련 URL만 필터 (일반 .on 제외)
+          const isSaveUrl =
+            url.includes("tmpSave") ||
+            url.includes("tmp_save") ||
+            url.includes("insertTmpSave") ||
+            url.includes("saveTmp") ||
+            url.includes("TmpWrtSbmsn") ||
+            url.includes("tmpWrt") ||
+            (url.includes("save") && url.includes(".on"));
+          return isSaveUrl && res.status() === 200;
         },
         { timeout: 15000 }
       );
-      saveConfirmed = true;
-      addLog(`ECFS 저장 응답: ${response.url()} (${response.status()})`, "info");
+      const respUrl = response.url();
+      addLog(`ECFS 저장 응답 URL: ${respUrl} (${response.status()})`, "info");
+
+      // 응답 본문 확인
+      try {
+        saveResponseBody = await response.text();
+        addLog(`ECFS 저장 응답 본문 (앞 300자): ${(saveResponseBody || "").substring(0, 300)}`, "info");
+        // ECFS 성공 응답은 보통 JSON에 에러 메시지가 없음
+        if (saveResponseBody && !saveResponseBody.includes("오류") && !saveResponseBody.includes("실패") && !saveResponseBody.includes("error")) {
+          saveConfirmed = true;
+        } else {
+          addLog("ECFS 저장 응답에 오류 징후가 있습니다.", "warning");
+        }
+      } catch {
+        // 응답 본문을 읽을 수 없는 경우에도 URL 매칭은 된 것이므로 일단 성공으로
+        saveConfirmed = true;
+      }
     } catch {
-      addLog("ECFS 저장 응답 감지 타임아웃 (15초). 저장이 완료되었을 수 있습니다.", "warning");
+      addLog("ECFS 저장 응답 감지 타임아웃 (15초)", "warning");
     }
 
-    // alert/confirm 대화상자 처리
-    await delay(500);
-    try {
-      // ECFS가 저장 완료 후 alert을 띄울 수 있음
-      page.on("dialog", async (dialog) => {
-        addLog(`ECFS 대화상자: ${dialog.type()} - ${dialog.message()}`, "info");
-        await dialog.accept();
-      });
-    } catch { /* ignore */ }
+    // dialog가 떴을 수 있으므로 잠시 대기
+    await delay(2000);
 
-    await delay(1000);
+    // [FIX] dialog 메시지로 저장 성공 여부 추가 판단
+    if (dialogMessages.length > 0) {
+      addLog(`ECFS 대화상자 메시지들: ${JSON.stringify(dialogMessages)}`, "info");
+      const hasSuccess = dialogMessages.some((m) =>
+        m.includes("저장") || m.includes("완료") || m.includes("성공")
+      );
+      const hasError = dialogMessages.some((m) =>
+        m.includes("오류") || m.includes("실패") || m.includes("입력") || m.includes("확인")
+      );
+      if (hasSuccess && !hasError) {
+        saveConfirmed = true;
+        addLog("ECFS 대화상자에서 저장 성공 확인", "success");
+      } else if (hasError) {
+        saveConfirmed = false;
+        addLog("ECFS 대화상자에서 오류 감지", "error");
+      }
+    }
 
-    addLog(`ECFS 임시저장 ${saveConfirmed ? "확인됨" : "완료 (응답 미확인)"}`, saveConfirmed ? "success" : "warning");
-    sendResult(ws, userId, requestId, true, null);
+    // [FIX] saveConfirmed가 false이면 실패로 보고 (이전에는 항상 true였음!)
+    if (saveConfirmed) {
+      addLog("ECFS 임시저장 확인됨", "success");
+      sendResult(ws, userId, requestId, true, null);
+    } else {
+      addLog("ECFS 임시저장 미확인: 저장 응답을 받지 못했습니다.", "error");
+      await logPageDiagnostics(page);
+      sendResult(ws, userId, requestId, false,
+        "ECFS 임시저장이 완료되지 않았습니다. 저장 응답을 확인할 수 없습니다. " +
+        (dialogMessages.length > 0 ? `ECFS 메시지: ${dialogMessages.join(", ")}` : "ECFS 응답 없음")
+      );
+    }
   } catch (err) {
     addLog(`ECFS 임시저장 오류: ${err.message}`, "error");
     sendResult(ws, userId, requestId, false, err.message);
@@ -606,10 +667,21 @@ async function fillForm(page, docType, formData, fieldsMap) {
             if (typeof comp.trigger === "function") {
               try { comp.trigger("change"); } catch { /* ignore */ }
             }
-            log.push(`OK: ${id} = ${String(value).substring(0, 20)}`);
+            // [FIX] setValue 후 실제로 값이 반영되었는지 검증
+            let actualVal = "";
+            try {
+              if (typeof comp.getValue === "function") actualVal = comp.getValue();
+            } catch { /* ignore */ }
+            const valStr = String(value).substring(0, 20);
+            const actStr = String(actualVal).substring(0, 20);
+            if (actualVal && String(actualVal) !== String(value)) {
+              log.push(`WARN: ${id} set=${valStr} got=${actStr}`);
+            } else {
+              log.push(`OK: ${id} = ${valStr}`);
+            }
             return true;
           }
-          log.push(`MISS: ${id}`);
+          log.push(`MISS: ${id} (컴포넌트 없음)`);
         } catch (e) {
           log.push(`ERR: ${id} - ${e.message}`);
         }
