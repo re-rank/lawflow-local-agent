@@ -134,6 +134,11 @@ function setupAutoUpdater() {
   autoUpdater.checkForUpdates().catch((e) => {
     addLog(`업데이트 확인 실패: ${e.message}`, "warning");
   });
+
+  // 30분마다 주기적 업데이트 확인
+  setInterval(() => {
+    autoUpdater.checkForUpdates().catch(() => {});
+  }, 30 * 60 * 1000);
 }
 
 // ── Electron 라이프사이클 ────────────────────────────────
