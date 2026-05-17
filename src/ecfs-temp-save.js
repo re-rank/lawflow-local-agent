@@ -202,25 +202,37 @@ async function handleEcfsTempSave(payload, ws, userId) {
 
     const saveClicked = await page.evaluate((btnId) => {
       const api = window.wq || window.$w;
-      // WebSquare API로 버튼 클릭
-      if (api && typeof api.getComponentById === "function") {
-        const btn = api.getComponentById(btnId);
-        if (btn && typeof btn.trigger === "function") {
-          btn.trigger("click");
-          return "websquare";
-        }
+      if (!api || typeof api.getComponentById !== "function") return null;
+
+      // 1. 직접 ID로 WebSquare 컴포넌트 조회
+      let btn = api.getComponentById(btnId);
+      if (btn && typeof btn.trigger === "function") {
+        btn.trigger("click");
+        return `websquare:${btnId}`;
       }
-      // DOM fallback - 여러 셀렉터 시도
+
+      // 2. DOM suffix 매칭으로 실제 full ID를 찾아서 WebSquare trigger
+      //    ECFS는 모든 컴포넌트에 "mf_pfwork_wfm_..." 접두사를 붙임
       const selectors = [
-        `#${btnId}`,
-        `[id$="${btnId}"]`,
         `[id$="_${btnId}"]`,
+        `[id$="${btnId}"]`,
+        `#${btnId}`,
         `button[id*="${btnId}"]`,
         `a[id*="${btnId}"]`,
       ];
       for (const sel of selectors) {
         const el = document.querySelector(sel);
-        if (el) { el.click(); return `dom:${sel}`; }
+        if (el && el.id) {
+          // full ID로 WebSquare 컴포넌트 재조회
+          btn = api.getComponentById(el.id);
+          if (btn && typeof btn.trigger === "function") {
+            btn.trigger("click");
+            return `websquare:${el.id}`;
+          }
+          // WebSquare trigger 불가 → DOM click fallback
+          el.click();
+          return `dom-click:${el.id}`;
+        }
       }
       return null;
     }, tmpSaveBtnId);
@@ -241,7 +253,7 @@ async function handleEcfsTempSave(payload, ws, userId) {
       const response = await page.waitForResponse(
         (res) => {
           const url = res.url();
-          // 임시저장 관련 URL만 필터 (일반 .on 제외)
+          // 임시저장 관련 URL 필터
           const isSaveUrl =
             url.includes("tmpSave") ||
             url.includes("tmp_save") ||
@@ -249,8 +261,12 @@ async function handleEcfsTempSave(payload, ws, userId) {
             url.includes("saveTmp") ||
             url.includes("TmpWrtSbmsn") ||
             url.includes("tmpWrt") ||
-            (url.includes("save") && url.includes(".on"));
-          return isSaveUrl && res.status() === 200;
+            url.includes("Tmpr") ||
+            url.includes("tmpr") ||
+            url.includes("insert") ||
+            url.includes("save") ||
+            url.includes("Save");
+          return isSaveUrl && url.includes(".on") && res.status() === 200;
         },
         { timeout: 15000 }
       );
@@ -690,13 +706,16 @@ async function fillForm(page, docType, formData, fieldsMap) {
 
       function clickRadio(id) {
         try {
-          // DOM 클릭
+          // 1. WebSquare 직접 ID
+          let comp = api.getComponentById(id);
+          if (comp && typeof comp.trigger === "function") { comp.trigger("click"); return true; }
+
+          // 2. DOM suffix 매칭 → full ID로 WebSquare trigger
           const el = document.querySelector(`[id$="_${id}"], [id$="${id}"], #${id}`);
-          if (el) { el.click(); return true; }
-          // WebSquare 컴포넌트
-          const comp = resolveComponent(id);
-          if (comp && typeof comp.trigger === "function") {
-            comp.trigger("click");
+          if (el && el.id) {
+            comp = api.getComponentById(el.id);
+            if (comp && typeof comp.trigger === "function") { comp.trigger("click"); return true; }
+            el.click();
             return true;
           }
         } catch {}
