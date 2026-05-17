@@ -12,6 +12,7 @@ const { handleEfilingSubmit } = require("./efiling-submit");
 const { handleEcfsLogin } = require("./ecfs-login");
 const { handleEcfsApiRequest } = require("./ecfs-api-proxy");
 const { handleEcfsTempSave } = require("./ecfs-temp-save");
+const { handleEcfsDiscover } = require("./ecfs-discover");
 
 /**
  * WebSocket을 통해 서버에 연결합니다.
@@ -133,6 +134,9 @@ function _onMessage(raw) {
     } else if (msg.type === "ecfs_temp_save") {
       addLog("ECFS 임시저장 요청 수신", "info");
       handleEcfsTempSave(msg.payload || msg, state.ws, String(state.userId));
+    } else if (msg.type === "ecfs_discover") {
+      addLog("ECFS 엔드포인트 Discovery 요청 수신", "info");
+      handleEcfsDiscover(msg.payload || msg, state.ws, String(state.userId));
     } else if (msg.type === "efiling_submit") {
       addLog(`전자소송 제출 요청 수신 (초안 #${msg.draftId})`, "info");
       handleEfilingSubmit(msg);
