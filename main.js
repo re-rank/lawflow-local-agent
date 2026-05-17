@@ -48,7 +48,7 @@ function createWindow() {
 // ── 자동 업데이트 ────────────────────────────────────────
 
 function setupAutoUpdater() {
-  autoUpdater.autoDownload = true;
+  autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = true;
 
   autoUpdater.on("checking-for-update", () => {
@@ -60,25 +60,55 @@ function setupAutoUpdater() {
   });
 
   autoUpdater.on("update-available", (info) => {
-    addLog(`업데이트 발견: v${info.version}, 다운로드 시작...`, "info");
+    addLog(`새 버전 발견: v${info.version}`, "info");
+
+    // 앱 실행 시 즉시 업데이트 팝업 표시
+    dialog
+      .showMessageBox(state.mainWindow, {
+        type: "info",
+        title: "업데이트 알림",
+        message: `LawFlow Agent 새 버전이 있습니다.`,
+        detail: `현재 버전: v${app.getVersion()}\n최신 버전: v${info.version}\n\n지금 업데이트하시겠습니까?`,
+        buttons: ["업데이트", "나중에"],
+        defaultId: 0,
+        cancelId: 1,
+      })
+      .then(({ response }) => {
+        if (response === 0) {
+          addLog(`v${info.version} 다운로드 시작...`, "info");
+          if (state.mainWindow) {
+            state.mainWindow.webContents.send("update-status", {
+              status: "downloading",
+              version: info.version,
+            });
+          }
+          autoUpdater.downloadUpdate();
+        }
+      });
+  });
+
+  autoUpdater.on("download-progress", (progress) => {
+    const pct = Math.round(progress.percent);
     if (state.mainWindow) {
       state.mainWindow.webContents.send("update-status", {
         status: "downloading",
-        version: info.version,
+        percent: pct,
       });
+      state.mainWindow.setProgressBar(pct / 100);
     }
   });
 
   autoUpdater.on("update-downloaded", (info) => {
     addLog(`업데이트 다운로드 완료: v${info.version}`, "success");
     if (state.mainWindow) {
+      state.mainWindow.setProgressBar(-1); // 프로그레스 바 제거
       state.mainWindow.webContents.send("update-status", {
         status: "ready",
         version: info.version,
       });
     }
     dialog
-      .showMessageBox({
+      .showMessageBox(state.mainWindow, {
         type: "info",
         title: "업데이트 준비 완료",
         message: `LawFlow Agent v${info.version} 업데이트가 준비되었습니다.\n지금 재시작하시겠습니까?`,
@@ -95,6 +125,9 @@ function setupAutoUpdater() {
 
   autoUpdater.on("error", (err) => {
     addLog(`자동 업데이트 오류: ${err.message}`, "error");
+    if (state.mainWindow) {
+      state.mainWindow.setProgressBar(-1);
+    }
   });
 
   // 앱 시작 후 업데이트 확인
