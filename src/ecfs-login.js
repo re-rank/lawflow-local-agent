@@ -357,95 +357,80 @@ async function handleEcfsLogin(payload) {
       }
     });
 
-    const execResult = await page.evaluate((userId, signValArg, encVidArg) => {
+    const execResult = await page.evaluate(async (userId, signValArg, encVidArg) => {
       const log = [];
 
-      const scwin = window.mf_pfwork_scwin;
-      const dma = window.mf_pfwork_dma_certparam;
-      const sbm = window.mf_pfwork_sbm_certlogin;
-      const idInput = window.mf_pfwork_ibx_elpUserIdForCert;
-
-      if (!scwin) return { phase: "init", success: false, error: "scwin 객체를 찾을 수 없습니다", log };
-      if (!dma) return { phase: "init", success: false, error: "dma_certparam DataMap을 찾을 수 없습니다", log };
-      if (!sbm) return { phase: "init", success: false, error: "sbm_certlogin Submission을 찾을 수 없습니다", log };
-
       try {
-        // 콜백 오버라이드 (결과 캡처)
-        window.__ecfsLoginResult = null;
-        window.__ecfsLoginError = null;
-
+        // Submission URL 확보 (WebSquare sbm 객체에서 추출)
+        let actionUrl = "/psp/psp001/certlogin.on";
         try {
-          const origDone = scwin.processCertLoginDone;
-          scwin.processCertLoginDone = function (e) {
-            try {
-              const r = JSON.parse(e.responseText);
-              window.__ecfsLoginResult = r;
-            } catch (parseErr) {
-              window.__ecfsLoginError = "응답 파싱 실패: " + parseErr.message;
+          const sbm = window.mf_pfwork_sbm_certlogin;
+          if (sbm) {
+            // WebSquare submission의 action 속성 탐색
+            const possibleAction = sbm.action || sbm._action || sbm.getAttribute?.("action");
+            if (possibleAction) {
+              actionUrl = possibleAction;
+              log.push("submission URL: " + actionUrl);
+            } else {
+              log.push("submission action 미발견, 기본 URL 사용");
             }
-            try { origDone.call(this, e); } catch {}
+          }
+        } catch (e) {
+          log.push("sbm 탐색 실패: " + e.message);
+        }
+
+        // 요청 데이터 구성
+        const clientTime = new Date().toISOString().replace("T", " ").split(".")[0];
+        let uuid;
+        try { uuid = crypto.randomUUID(); } catch { uuid = String(Date.now()); }
+
+        const requestBody = {
+          data: {
+            dma_certparam: {
+              elpUserId: userId.trim(),
+              signVal: signValArg,
+              encVid: encVidArg,
+              loginType: "P",
+              clientTime: clientTime,
+              uuid: uuid,
+            }
+          }
+        };
+
+        log.push(`직접 POST 실행: ${actionUrl} (userId: ${userId.trim()})`);
+
+        // 직접 fetch로 로그인 요청 전송
+        const resp = await fetch(actionUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+          },
+          body: JSON.stringify(requestBody),
+          credentials: "include",
+        });
+
+        log.push(`응답 상태: ${resp.status}`);
+
+        if (!resp.ok) {
+          return {
+            phase: "http",
+            success: false,
+            error: `HTTP ${resp.status}: ${resp.statusText}`,
+            log,
           };
-          log.push("콜백 오버라이드 완료");
-        } catch (e) {
-          log.push("콜백 오버라이드 실패 (비치명적): " + e.message);
         }
 
-        // 아이디 입력
-        try {
-          if (idInput && typeof idInput.setValue === "function") {
-            idInput.setValue(userId.trim());
-          }
-          dma.set("elpUserId", userId.trim());
-          log.push("아이디 설정: " + userId.trim());
-        } catch (e) {
-          return { phase: "userid", success: false, error: "아이디 설정 실패: " + e.message, log };
-        }
+        const respData = await resp.json();
+        log.push(`응답 데이터: ${JSON.stringify(respData).substring(0, 200)}`);
 
-        // DataMap에 서명 데이터 설정
-        try {
-          dma.set("signVal", signValArg);
-          dma.set("encVid", encVidArg);
-          dma.set("loginType", "P");
-          dma.set("clientTime", new Date().toISOString().replace("T", " ").split(".")[0]);
-          try {
-            dma.set("uuid", crypto.randomUUID());
-          } catch {
-            dma.set("uuid", String(Date.now()));
-          }
-          log.push("DataMap 설정 완료");
-        } catch (e) {
-          return { phase: "datamap", success: false, error: "DataMap 설정 실패: " + e.message, log };
-        }
-
-        // Submission 실행
-        log.push("sbm_certlogin 실행...");
-        try {
-          const scope = typeof gcm !== "undefined" && gcm._getScope
-            ? gcm._getScope("mf_pfwork") : null;
-          const scopeP = scope && scope.$p;
-
-          if (scopeP && typeof scopeP.executeSubmission === "function") {
-            scopeP.executeSubmission(sbm);
-            log.push("submission 전송됨 (gcm scope.$p)");
-          } else if (typeof $p !== "undefined" && typeof $p.executeSubmission === "function") {
-            $p.executeSubmission(sbm);
-            log.push("submission 전송됨 ($p)");
-          } else if (typeof com !== "undefined" && typeof com.executeSubmission === "function") {
-            com.executeSubmission(sbm);
-            log.push("submission 전송됨 (com)");
-          } else if (typeof sbm.execute === "function") {
-            sbm.execute();
-            log.push("submission 전송됨 (sbm.execute)");
-          } else {
-            return { phase: "submit", success: false, error: "Submission 실행 방법을 찾을 수 없습니다.", log };
-          }
-        } catch (e) {
-          return { phase: "submit", success: false, error: "Submission 실행 실패: " + e.message, log };
-        }
+        // 서버 응답 결과 저장
+        window.__ecfsLoginResult = respData;
+        window.__ecfsLoginError = null;
 
         return { phase: "submitted", success: true, log };
       } catch (err) {
-        return { phase: "unknown", success: false, error: err.message, log };
+        return { phase: "fetch", success: false, error: err.message, log };
       }
     }, ecfsUserId, signVal, encVid);
 
@@ -467,55 +452,16 @@ async function handleEcfsLogin(payload) {
     const execLogs = (execResult.log || []).join(" → ");
     addLog(`로그인 실행 성공: ${execLogs}`, "info");
 
+    // 직접 fetch 방식에서는 결과가 즉시 저장됨 (waitForFunction 불필요)
+    // 만약 결과가 아직 없으면 짧은 대기
     try {
       await page.waitForFunction(
         () => window.__ecfsLoginResult !== null || window.__ecfsLoginError !== null,
-        { timeout: LOGIN_TIMEOUT_MS }
+        { timeout: 10_000 }
       );
     } catch {
-      // 타임아웃 - 페이지 상태 + 디버그 정보 수집
-      const finalState = await page
-        .evaluate(() => ({
-          url: location.href,
-          text: document.body
-            ? document.body.innerText.replace(/\s+/g, " ").trim().substring(0, 500)
-            : "",
-          result: window.__ecfsLoginResult,
-          error: window.__ecfsLoginError,
-          hasScwin: !!window.mf_pfwork_scwin,
-          hasDma: !!window.mf_pfwork_dma_certparam,
-          dmaKeys: (() => {
-            try {
-              const d = window.mf_pfwork_dma_certparam;
-              return d ? Object.keys(d._data || d.data || {}).join(",") : "N/A";
-            } catch { return "에러"; }
-          })(),
-        }))
-        .catch(() => ({ url: "?", text: "(추출 실패)" }));
-
-      addLog(`로그인 응답 대기 시간 초과. URL: ${finalState.url}`, "error");
-      addLog(`HTTP요청전송=${submissionResponseReceived}, URL=${submissionUrl}`, "info");
-      addLog(`scwin=${finalState.hasScwin}, dma=${finalState.hasDma}, dmaKeys=${finalState.dmaKeys}`, "info");
-      addLog(`페이지: ${finalState.text.substring(0, 200)}`, "info");
-
-      // 타임아웃이어도 로그인 성공했을 수 있음 (콜백이 호출되지 않은 경우)
-      if (
-        finalState.text.includes("로그아웃") ||
-        finalState.text.includes("마이페이지")
-      ) {
-        addLog("로그인 성공 감지 (텍스트 기반)", "success");
-        const cookies = await _extractCookies(page);
-        _sendResult(requestId, true, cookies, null, null);
-        send("agent:efiling-status", { status: "completed", step: "로그인 완료" });
-        await browser.close().catch(() => {});
-        return;
-      }
-
-      const debugInfo = `scwin=${finalState.hasScwin},dma=${finalState.hasDma},httpSent=${submissionResponseReceived}`;
-      _sendResult(
-        requestId, false, null, null,
-        `로그인 응답 대기 시간 초과 [${debugInfo}]. 페이지: ${finalState.text.substring(0, 150)}`
-      );
+      addLog("로그인 응답 대기 시간 초과 (10초)", "error");
+      _sendResult(requestId, false, null, null, "로그인 응답을 받지 못했습니다.");
       send("agent:efiling-status", { status: "error", error: "응답 대기 시간 초과" });
       await browser.close().catch(() => {});
       return;

@@ -2,8 +2,10 @@ name: Build & Release
 
 on:
   push:
+    branches: [master]
     tags:
       - 'v*'
+  workflow_dispatch:
 
 jobs:
   build-windows:
@@ -26,10 +28,24 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload release assets
+      - name: Get version
+        id: version
+        run: echo "version=$(node -p "require('./package.json').version")" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      - name: Delete existing latest release
+        continue-on-error: true
+        run: gh release delete "v${{ steps.version.outputs.version }}" --yes --cleanup-tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: "v${{ steps.version.outputs.version }}"
+          name: "LawFlow Agent v${{ steps.version.outputs.version }}"
           files: |
             dist/LawFlow-Agent-Setup.exe
             dist/latest.yml
+          make_latest: true
           generate_release_notes: true
