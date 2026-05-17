@@ -242,6 +242,22 @@
     .log-line.error { color: #f87171; }
     .log-line.warning { color: #fbbf24; }
     .log-line.info { color: #93c5fd; }
+    .btn-copy-log {
+      margin-left: auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      border-radius: 5px;
+      border: 1px solid var(--gray-200);
+      background: var(--gray-50);
+      color: var(--gray-500);
+      font-size: 11px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn-copy-log:hover { background: var(--gray-100); color: var(--gray-700); }
+    .btn-copy-log.copied { background: var(--green-50); color: var(--green-700); border-color: var(--green-100); }
 
     /* ── 서버 URL (접기) ── */
     .collapse-btn {
@@ -386,6 +402,10 @@
       <div class="card-header">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
         활동 로그
+        <button class="btn-copy-log" onclick="handleCopyLog()" title="로그 복사">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          복사
+        </button>
       </div>
       <div class="card-body" style="padding:12px;">
         <div class="log-area" id="logArea"></div>
@@ -494,6 +514,21 @@
       const d = document.createElement("div");
       d.textContent = str;
       return d.innerHTML;
+    }
+
+    function handleCopyLog() {
+      const area = document.getElementById("logArea");
+      const lines = Array.from(area.querySelectorAll(".log-line"));
+      const text = lines.map((el) => el.textContent).join("\n");
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = document.querySelector(".btn-copy-log");
+        btn.classList.add("copied");
+        btn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg> 복사됨';
+        setTimeout(() => {
+          btn.classList.remove("copied");
+          btn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> 복사';
+        }, 2000);
+      });
     }
 
     // ── 핸들러 ──
