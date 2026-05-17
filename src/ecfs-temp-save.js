@@ -60,7 +60,7 @@ async function handleEcfsTempSave(payload, ws, userId) {
 
     const launchOpts = {
       executablePath: chromePath,
-      headless: "new",
+      headless: false,
       args: [
         "--no-sandbox",
         "--disable-gpu",
