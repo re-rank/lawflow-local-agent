@@ -236,45 +236,84 @@ async function handleEcfsTempSave(payload, ws, userId) {
 
     addLog(`임시저장 버튼 발견: id=${btnSelector.id}, tag=${btnSelector.tagName}, visible=${btnSelector.visible}, disabled=${btnSelector.disabled}, text="${btnSelector.text}"`, "info");
 
-    // Puppeteer 네이티브 클릭 (실제 마우스 이벤트 발생 - 가장 확실한 방법)
-    try {
-      await page.click(btnSelector.selector);
-      addLog(`임시저장 버튼 클릭: puppeteer-click:${btnSelector.selector}`, "info");
-    } catch (clickErr) {
-      // Puppeteer click 실패 시 fallback
-      addLog(`Puppeteer click 실패 (${clickErr.message}), evaluate click 시도`, "warning");
-      await page.evaluate((sel) => {
-        const el = document.querySelector(sel);
-        if (el) {
-          // dispatchEvent로 실제 마우스 이벤트 시뮬레이션
-          el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+    // 콘솔 메시지 캡처 (JS 에러 감지용)
+    const consoleMessages = [];
+    page.on("console", (msg) => {
+      if (msg.type() === "error" || msg.type() === "warning") {
+        consoleMessages.push(`[${msg.type()}] ${msg.text()}`);
+      }
+    });
+
+    // 모든 네트워크 요청 감시 (어떤 요청이 발생하는지 확인)
+    const networkRequests = [];
+    page.on("request", (req) => {
+      const url = req.url();
+      if (url.includes(".on") || url.includes("save") || url.includes("Save")) {
+        networkRequests.push(url);
+      }
+    });
+
+    // ── 버튼 클릭 방법 3단계 시도 ──
+
+    // 방법 1: WebSquare scwin 함수 직접 호출 (가장 확실)
+    const scwinResult = await page.evaluate((btnId) => {
+      try {
+        // WebSquare에서 버튼 onclick 핸들러는 scwin.{btnId}_onclick 형식
+        const scwinScope = window.scwin || (window.$w && window.$w.scwin);
+        if (scwinScope) {
+          const handlerName = `${btnId}_onclick`;
+          if (typeof scwinScope[handlerName] === "function") {
+            scwinScope[handlerName]();
+            return `scwin:${handlerName}`;
+          }
+          // scwin 내 함수 목록에서 tmpSave 관련 함수 검색
+          const tmpSaveFns = Object.keys(scwinScope).filter(
+            (k) => typeof scwinScope[k] === "function" &&
+              (k.toLowerCase().includes("tmpsave") || k.toLowerCase().includes("tmp_save") || k.toLowerCase().includes("임시저장"))
+          );
+          if (tmpSaveFns.length > 0) {
+            scwinScope[tmpSaveFns[0]]();
+            return `scwin:${tmpSaveFns[0]}`;
+          }
+          return { notFound: true, availableFns: Object.keys(scwinScope).filter((k) => typeof scwinScope[k] === "function").slice(0, 30) };
         }
-      }, btnSelector.selector);
-      addLog(`임시저장 버튼 클릭: dispatch-click:${btnSelector.selector}`, "info");
+        return { noScwin: true };
+      } catch (e) {
+        return { error: e.message };
+      }
+    }, tmpSaveBtnId);
+
+    if (typeof scwinResult === "string") {
+      addLog(`임시저장 함수 직접 호출 성공: ${scwinResult}`, "info");
+    } else {
+      // scwin 함수 호출 실패 → 로그 출력 후 Puppeteer 클릭으로 fallback
+      if (scwinResult?.availableFns) {
+        addLog(`scwin에서 tmpSave 함수 못 찾음. 사용 가능한 함수: ${scwinResult.availableFns.join(", ")}`, "warning");
+      } else {
+        addLog(`scwin 접근 실패: ${JSON.stringify(scwinResult)}`, "warning");
+      }
+
+      // 방법 2: Puppeteer 네이티브 클릭
+      try {
+        await page.click(btnSelector.selector);
+        addLog(`Puppeteer click: ${btnSelector.selector}`, "info");
+      } catch (clickErr) {
+        addLog(`Puppeteer click 실패: ${clickErr.message}`, "warning");
+        // 방법 3: dispatchEvent
+        await page.evaluate((sel) => {
+          const el = document.querySelector(sel);
+          if (el) el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+        }, btnSelector.selector);
+        addLog(`dispatch-click: ${btnSelector.selector}`, "info");
+      }
     }
 
-    // [FIX] 저장 응답 감시 - 더 구체적인 URL 필터 + 응답 본문 검증
+    // 저장 응답 감시 (모든 .on 요청 대상)
     let saveConfirmed = false;
     let saveResponseBody = null;
     try {
       const response = await page.waitForResponse(
-        (res) => {
-          const url = res.url();
-          // 임시저장 관련 URL 필터
-          const isSaveUrl =
-            url.includes("tmpSave") ||
-            url.includes("tmp_save") ||
-            url.includes("insertTmpSave") ||
-            url.includes("saveTmp") ||
-            url.includes("TmpWrtSbmsn") ||
-            url.includes("tmpWrt") ||
-            url.includes("Tmpr") ||
-            url.includes("tmpr") ||
-            url.includes("insert") ||
-            url.includes("save") ||
-            url.includes("Save");
-          return isSaveUrl && url.includes(".on") && res.status() === 200;
-        },
+        (res) => res.url().includes(".on") && res.status() === 200,
         { timeout: 15000 }
       );
       const respUrl = response.url();
@@ -319,7 +358,17 @@ async function handleEcfsTempSave(payload, ws, userId) {
       }
     }
 
-    // [FIX] saveConfirmed가 false이면 실패로 보고 (이전에는 항상 true였음!)
+    // 콘솔 에러/네트워크 요청 로그 출력
+    if (consoleMessages.length > 0) {
+      addLog(`브라우저 콘솔: ${consoleMessages.slice(0, 5).join(" | ")}`, "warning");
+    }
+    if (networkRequests.length > 0) {
+      addLog(`감지된 네트워크 요청: ${networkRequests.join(" | ")}`, "info");
+    } else {
+      addLog("버튼 클릭 후 네트워크 요청 없음", "warning");
+    }
+
+    // saveConfirmed가 false이면 실패로 보고
     if (saveConfirmed) {
       addLog("ECFS 임시저장 확인됨", "success");
       sendResult(ws, userId, requestId, true, null);
@@ -328,7 +377,9 @@ async function handleEcfsTempSave(payload, ws, userId) {
       await logPageDiagnostics(page);
       sendResult(ws, userId, requestId, false,
         "ECFS 임시저장이 완료되지 않았습니다. 저장 응답을 확인할 수 없습니다. " +
-        (dialogMessages.length > 0 ? `ECFS 메시지: ${dialogMessages.join(", ")}` : "ECFS 응답 없음")
+        (dialogMessages.length > 0 ? `ECFS 메시지: ${dialogMessages.join(", ")}` : "") +
+        (consoleMessages.length > 0 ? ` 콘솔에러: ${consoleMessages[0]}` : "") +
+        (networkRequests.length === 0 ? " (네트워크 요청 없음)" : "")
       );
     }
   } catch (err) {
