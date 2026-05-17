@@ -363,25 +363,10 @@ async function handleEcfsLogin(payload) {
       const log = [];
 
       try {
-        // Submission URL 확보 (WebSquare sbm 객체에서 추출)
-        let actionUrl = "/psp/psp001/certlogin.on";
-        try {
-          const sbm = window.mf_pfwork_sbm_certlogin;
-          if (sbm) {
-            // WebSquare submission의 action 속성 탐색
-            const possibleAction = sbm.action || sbm._action || sbm.getAttribute?.("action");
-            if (possibleAction) {
-              actionUrl = possibleAction;
-              log.push("submission URL: " + actionUrl);
-            } else {
-              log.push("submission action 미발견, 기본 URL 사용");
-            }
-          }
-        } catch (e) {
-          log.push("sbm 탐색 실패: " + e.message);
-        }
+        // Submission URL 확보
+        const actionUrl = "/psp/psp001/certlogin.on";
 
-        // 요청 데이터 구성
+        // 요청 데이터 구성 (WebSquare DataMap 포맷)
         const clientTime = new Date().toISOString().replace("T", " ").split(".")[0];
         let uuid;
         try { uuid = crypto.randomUUID(); } catch { uuid = String(Date.now()); }
@@ -394,39 +379,44 @@ async function handleEcfsLogin(payload) {
               encVid: encVidArg,
               loginType: "P",
               clientTime: clientTime,
+              apiKey: "",
+              rtnUrl: "",
               uuid: uuid,
             }
           }
         };
 
-        log.push(`직접 POST 실행: ${actionUrl} (userId: ${userId.trim()})`);
+        log.push(`직접 POST: ${actionUrl} (userId: ${userId.trim()})`);
 
-        // 직접 fetch로 로그인 요청 전송
+        // SC-* 커스텀 헤더 (preSubmitFunction이 설정하는 헤더)
         const resp = await fetch(actionUrl, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "SC-Userid": "anonymous",
+            "SC-Traceid": "PSP101M01@anonymous",
+            "SC-Pgmid": "PSP101M01",
           },
           body: JSON.stringify(requestBody),
           credentials: "include",
         });
 
-        log.push(`응답 상태: ${resp.status}`);
+        log.push(`응답: ${resp.status}`);
 
         if (!resp.ok) {
+          const errText = await resp.text().catch(() => "");
           return {
             phase: "http",
             success: false,
-            error: `HTTP ${resp.status}: ${resp.statusText}`,
+            error: `HTTP ${resp.status}: ${errText.substring(0, 200)}`,
             log,
           };
         }
 
         const respData = await resp.json();
-        log.push(`응답 데이터: ${JSON.stringify(respData).substring(0, 200)}`);
+        log.push(`결과: ${JSON.stringify(respData).substring(0, 300)}`);
 
-        // 서버 응답 결과 저장
         window.__ecfsLoginResult = respData;
         window.__ecfsLoginError = null;
 
