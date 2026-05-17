@@ -22,6 +22,7 @@ const path = require("path");
 const WebSocket = require("ws");
 const state = require("./state");
 const { send, addLog } = require("./utils");
+const { loadConfig } = require("./config");
 const { createCmsSignedData, createVidEnvelope } = require("./ecfs-crypto");
 
 /** 시스템 Chrome 경로 탐색 (Windows) */
@@ -340,9 +341,10 @@ async function handleEcfsLogin(payload) {
     addLog("로그인 데이터 주입 및 제출...", "info");
     send("agent:efiling-status", { status: "processing", step: "로그인 실행" });
 
-    // ECFS 사용자 ID: payload에서 제공되면 사용, 없으면 state.userId 사용
-    const ecfsUserId = payload.ecfsUserId || payload.loginId || state.userId || "";
-    addLog(`ECFS 사용자ID: "${ecfsUserId}"`, "info");
+    // ECFS 사용자 ID: payload에서 제공되면 사용, 없으면 config의 email(실제 로그인 아이디) 사용
+    const cfg = loadConfig();
+    const ecfsUserId = payload.ecfsUserId || payload.loginId || cfg.email || state.userId || "";
+    addLog(`ECFS 사용자ID: "${ecfsUserId}" (config.email: ${cfg.email || "없음"})`, "info");
 
     // submission HTTP 요청 모니터링
     let submissionRequestSent = false;
