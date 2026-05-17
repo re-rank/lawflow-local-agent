@@ -472,10 +472,18 @@ async function handleEcfsLogin(payload) {
     }
 
     const serverResp = loginResult.result;
-    addLog(`서버 응답: ${JSON.stringify(serverResp).substring(0, 200)}`, "info");
+    addLog(`서버 응답: ${JSON.stringify(serverResp).substring(0, 300)}`, "info");
 
-    const respCode = serverResp?.data?.respCode;
-    const respMesg = serverResp?.data?.respMesg || "";
+    // WebSquare 응답 형식: { data: { dma_certparam: { respCode, respMesg } } }
+    // 또는 직접 형식:     { data: { respCode, respMesg } }
+    // 또는 플랫 형식:     { dma_certparam: { respCode, respMesg } }
+    const d = serverResp?.data?.dma_certparam
+           || serverResp?.data
+           || serverResp?.dma_certparam
+           || serverResp
+           || {};
+    const respCode = d.respCode;
+    const respMesg = d.respMesg || d.errMsg || "";
 
     if (respCode === "00") {
       // 로그인 성공

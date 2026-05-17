@@ -360,29 +360,35 @@ function _parsePkcs8PrivateKey(derBuf) {
 // ---------------------------------------------------------------------------
 
 /**
- * CMS (PKCS#7) SignedData를 생성합니다.
+ * CMS (PKCS#7) SignedData를 수동 구성합니다.
  *
- * ECFS 서버는 AnySign4PC의 signDataCMS 명령이 반환하는
- * PKCS#7 SignedData(DER, Base64)를 기대합니다.
+ * forge의 고수준 PKCS#7 API는 certificateToAsn1()로 인증서를 재인코딩하는데,
+ * 한국 NPKI 인증서의 DN 인코딩이 원본 DER과 달라질 수 있습니다.
+ * 이를 방지하기 위해 ASN.1 구조를 직접 구성하고,
+ * 원본 인증서 DER 바이트를 그대로 임베딩합니다.
  *
  * @param {string} plainText - 서명할 원문 (예: "SCMAIN")
  * @returns {string} Base64 인코딩된 CMS SignedData DER
  */
 function createCmsSignedData(plainText) {
-  // Step 1: 인증서 읽기 (DER → forge certificate)
-  let cert;
+  const a = forge.asn1;
+
+  // ── Step 1: 인증서 읽기 (원본 DER 보존) ──
+  let certAsn1;
   try {
     const certDerBuf = fs.readFileSync(state.certPath);
-    const certAsn1   = forge.asn1.fromDer(
-      forge.util.createBuffer(certDerBuf.toString("binary")),
+    const certBinary = certDerBuf.toString("binary");
+
+    // 원본 ASN.1 트리 (SignedData certificates 필드에 그대로 사용)
+    certAsn1 = a.fromDer(
+      forge.util.createBuffer(certBinary),
       { strict: false, parseAllBytes: false }
     );
-    cert = forge.pki.certificateFromAsn1(certAsn1);
   } catch (e) {
     throw new Error(`[1단계] 인증서 읽기 실패 (${state.certPath}): ${e.message}`);
   }
 
-  // Step 2: 개인키 복호화 (SEED-CBC 순수 JS 구현 사용)
+  // ── Step 2: 개인키 복호화 ──
   let privateKey;
   try {
     privateKey = decryptNpkiPrivateKey(state.certKeyPath, state.certPassword);
@@ -390,37 +396,170 @@ function createCmsSignedData(plainText) {
     throw new Error(`[2단계] 개인키 복호화 실패: ${e.message}`);
   }
 
-  // Step 3: PKCS#7 SignedData 구성 및 서명
+  // ── Step 3: 원본 인증서에서 issuer, serialNumber ASN.1 추출 ──
+  //
+  // Certificate → TBSCertificate → { [0]version, serialNumber, sigAlg, issuer, ... }
+  // 원본 ASN.1 노드를 복제하여 SignerInfo.issuerAndSerialNumber에 사용
+  //
+  let issuerClone, serialClone;
   try {
-    const p7 = forge.pkcs7.createSignedData();
-    p7.content = forge.util.createBuffer(plainText, "utf8");
-    p7.addCertificate(cert);
-    p7.addSigner({
-      key: privateKey,
-      certificate: cert,
-      digestAlgorithm: forge.pki.oids.sha256,
-      authenticatedAttributes: [
-        {
-          type: forge.pki.oids.contentType,
-          value: forge.pki.oids.data,
-        },
-        {
-          type: forge.pki.oids.messageDigest,
-          // forge가 자동 계산
-        },
-        {
-          type: forge.pki.oids.signingTime,
-          value: new Date(),
-        },
-      ],
-    });
-    p7.sign();
+    const tbs = certAsn1.value[0]; // TBSCertificate SEQUENCE
+    let idx = 0;
+    // v3 인증서: [0] EXPLICIT version 태그가 있으면 건너뜀
+    if (tbs.value[0].tagClass === a.Class.CONTEXT_SPECIFIC) {
+      idx = 1;
+    }
+    const serialNode = tbs.value[idx];       // serialNumber INTEGER
+    const issuerNode = tbs.value[idx + 2];   // issuer Name (sigAlg 건너뜀)
 
-    // DER → Base64
-    const derBytes = forge.asn1.toDer(p7.toAsn1()).getBytes();
+    // DER round-trip으로 독립 복제 (부모 참조 공유 방지)
+    issuerClone = a.fromDer(a.toDer(issuerNode).getBytes());
+    serialClone = a.fromDer(a.toDer(serialNode).getBytes());
+
+    addLog(
+      `인증서 issuer 추출: serial=${forge.util.bytesToHex(a.toDer(serialClone).getBytes()).substring(0, 20)}...`,
+      "info"
+    );
+  } catch (e) {
+    throw new Error(`[3단계] 인증서 issuer/serial 추출 실패: ${e.message}`);
+  }
+
+  // ── Step 4: CMS SignedData 수동 구성 ──
+  try {
+    // 콘텐츠 바이트 (UTF-8)
+    const contentBytes = forge.util.encodeUtf8(plainText);
+
+    // 콘텐츠 다이제스트 (SHA-256)
+    const contentMd = forge.md.sha256.create();
+    contentMd.update(contentBytes, "raw");
+    const contentDigest = contentMd.digest();
+
+    // ── 인증 속성(authenticatedAttributes) 빌더 ──
+    const now = new Date();
+
+    function _buildContentTypeAttr() {
+      return a.create(a.Class.UNIVERSAL, a.Type.SEQUENCE, true, [
+        a.create(a.Class.UNIVERSAL, a.Type.OID, false,
+          a.oidToDer(forge.pki.oids.contentType).getBytes()),
+        a.create(a.Class.UNIVERSAL, a.Type.SET, true, [
+          a.create(a.Class.UNIVERSAL, a.Type.OID, false,
+            a.oidToDer(forge.pki.oids.data).getBytes()),
+        ]),
+      ]);
+    }
+
+    function _buildMsgDigestAttr() {
+      return a.create(a.Class.UNIVERSAL, a.Type.SEQUENCE, true, [
+        a.create(a.Class.UNIVERSAL, a.Type.OID, false,
+          a.oidToDer(forge.pki.oids.messageDigest).getBytes()),
+        a.create(a.Class.UNIVERSAL, a.Type.SET, true, [
+          a.create(a.Class.UNIVERSAL, a.Type.OCTETSTRING, false,
+            contentDigest.bytes()),
+        ]),
+      ]);
+    }
+
+    function _buildSigningTimeAttr() {
+      return a.create(a.Class.UNIVERSAL, a.Type.SEQUENCE, true, [
+        a.create(a.Class.UNIVERSAL, a.Type.OID, false,
+          a.oidToDer(forge.pki.oids.signingTime).getBytes()),
+        a.create(a.Class.UNIVERSAL, a.Type.SET, true, [
+          a.create(a.Class.UNIVERSAL, a.Type.UTCTIME, false,
+            a.dateToUtcTime(now)),
+        ]),
+      ]);
+    }
+
+    // 서명용 SET (태그 0x31) — RSA 서명 입력
+    const attrsForSign = a.create(a.Class.UNIVERSAL, a.Type.SET, true, [
+      _buildContentTypeAttr(),
+      _buildMsgDigestAttr(),
+      _buildSigningTimeAttr(),
+    ]);
+
+    // 임베딩용 [0] IMPLICIT (태그 0xA0) — SignerInfo에 포함
+    const attrsForEmbed = a.create(a.Class.CONTEXT_SPECIFIC, 0, true, [
+      _buildContentTypeAttr(),
+      _buildMsgDigestAttr(),
+      _buildSigningTimeAttr(),
+    ]);
+
+    // ── RSA 서명 (SET-DER 위에 SHA-256 + PKCS#1 v1.5) ──
+    const attrsDer = a.toDer(attrsForSign).getBytes();
+    const signMd = forge.md.sha256.create();
+    signMd.update(attrsDer, "raw");
+    const signature = privateKey.sign(signMd);
+
+    addLog(`CMS 서명 생성: attrs DER ${attrsDer.length}바이트, sig ${signature.length}바이트`, "info");
+
+    // ── SignerInfo 구성 ──
+    const signerInfo = a.create(a.Class.UNIVERSAL, a.Type.SEQUENCE, true, [
+      // version 1
+      a.create(a.Class.UNIVERSAL, a.Type.INTEGER, false,
+        a.integerToDer(1).getBytes()),
+      // issuerAndSerialNumber (원본 인증서에서 추출)
+      a.create(a.Class.UNIVERSAL, a.Type.SEQUENCE, true, [
+        issuerClone,
+        serialClone,
+      ]),
+      // digestAlgorithm SHA-256
+      a.create(a.Class.UNIVERSAL, a.Type.SEQUENCE, true, [
+        a.create(a.Class.UNIVERSAL, a.Type.OID, false,
+          a.oidToDer(forge.pki.oids.sha256).getBytes()),
+        a.create(a.Class.UNIVERSAL, a.Type.NULL, false, ""),
+      ]),
+      // signedAttrs [0] IMPLICIT
+      attrsForEmbed,
+      // signatureAlgorithm RSA
+      a.create(a.Class.UNIVERSAL, a.Type.SEQUENCE, true, [
+        a.create(a.Class.UNIVERSAL, a.Type.OID, false,
+          a.oidToDer(forge.pki.oids.rsaEncryption).getBytes()),
+        a.create(a.Class.UNIVERSAL, a.Type.NULL, false, ""),
+      ]),
+      // encryptedDigest (서명 값)
+      a.create(a.Class.UNIVERSAL, a.Type.OCTETSTRING, false, signature),
+    ]);
+
+    // ── SignedData 구성 ──
+    const signedData = a.create(a.Class.UNIVERSAL, a.Type.SEQUENCE, true, [
+      // version 1
+      a.create(a.Class.UNIVERSAL, a.Type.INTEGER, false,
+        a.integerToDer(1).getBytes()),
+      // digestAlgorithms SET
+      a.create(a.Class.UNIVERSAL, a.Type.SET, true, [
+        a.create(a.Class.UNIVERSAL, a.Type.SEQUENCE, true, [
+          a.create(a.Class.UNIVERSAL, a.Type.OID, false,
+            a.oidToDer(forge.pki.oids.sha256).getBytes()),
+          a.create(a.Class.UNIVERSAL, a.Type.NULL, false, ""),
+        ]),
+      ]),
+      // encapContentInfo
+      a.create(a.Class.UNIVERSAL, a.Type.SEQUENCE, true, [
+        a.create(a.Class.UNIVERSAL, a.Type.OID, false,
+          a.oidToDer(forge.pki.oids.data).getBytes()),
+        // [0] EXPLICIT content
+        a.create(a.Class.CONTEXT_SPECIFIC, 0, true, [
+          a.create(a.Class.UNIVERSAL, a.Type.OCTETSTRING, false, contentBytes),
+        ]),
+      ]),
+      // certificates [0] IMPLICIT (원본 인증서 ASN.1 그대로 사용)
+      a.create(a.Class.CONTEXT_SPECIFIC, 0, true, [certAsn1]),
+      // signerInfos SET
+      a.create(a.Class.UNIVERSAL, a.Type.SET, true, [signerInfo]),
+    ]);
+
+    // ── ContentInfo 래퍼 ──
+    const contentInfo = a.create(a.Class.UNIVERSAL, a.Type.SEQUENCE, true, [
+      a.create(a.Class.UNIVERSAL, a.Type.OID, false,
+        a.oidToDer(forge.pki.oids.signedData).getBytes()),
+      a.create(a.Class.CONTEXT_SPECIFIC, 0, true, [signedData]),
+    ]);
+
+    const derBytes = a.toDer(contentInfo).getBytes();
+    addLog(`CMS SignedData 완료: ${derBytes.length}바이트 DER`, "info");
     return forge.util.encode64(derBytes);
   } catch (e) {
-    throw new Error(`[3단계] CMS 서명 실패: ${e.message}`);
+    throw new Error(`[4단계] CMS 서명 실패: ${e.message}`);
   }
 }
 
