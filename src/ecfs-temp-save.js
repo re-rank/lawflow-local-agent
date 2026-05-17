@@ -200,19 +200,8 @@ async function handleEcfsTempSave(payload, ws, userId) {
     const tmpSaveBtnId = fieldsMap.buttons.tmpSave;
     addLog(`임시저장 버튼 클릭 시도: ${tmpSaveBtnId}`, "info");
 
-    const saveClicked = await page.evaluate((btnId) => {
-      const api = window.wq || window.$w;
-      if (!api || typeof api.getComponentById !== "function") return null;
-
-      // 1. 직접 ID로 WebSquare 컴포넌트 조회
-      let btn = api.getComponentById(btnId);
-      if (btn && typeof btn.trigger === "function") {
-        btn.trigger("click");
-        return `websquare:${btnId}`;
-      }
-
-      // 2. DOM suffix 매칭으로 실제 full ID를 찾아서 WebSquare trigger
-      //    ECFS는 모든 컴포넌트에 "mf_pfwork_wfm_..." 접두사를 붙임
+    // 버튼의 실제 CSS 셀렉터를 먼저 찾는다
+    const btnSelector = await page.evaluate((btnId) => {
       const selectors = [
         `[id$="_${btnId}"]`,
         `[id$="${btnId}"]`,
@@ -222,29 +211,47 @@ async function handleEcfsTempSave(payload, ws, userId) {
       ];
       for (const sel of selectors) {
         const el = document.querySelector(sel);
-        if (el && el.id) {
-          // full ID로 WebSquare 컴포넌트 재조회
-          btn = api.getComponentById(el.id);
-          if (btn && typeof btn.trigger === "function") {
-            btn.trigger("click");
-            return `websquare:${el.id}`;
-          }
-          // WebSquare trigger 불가 → DOM click fallback
-          el.click();
-          return `dom-click:${el.id}`;
+        if (el) {
+          // 버튼 상태 확인
+          const info = {
+            selector: el.id ? `#${el.id}` : sel,
+            id: el.id,
+            tagName: el.tagName,
+            visible: el.offsetParent !== null,
+            disabled: el.disabled || el.getAttribute("aria-disabled") === "true",
+            text: (el.textContent || "").trim().substring(0, 30),
+          };
+          return info;
         }
       }
       return null;
     }, tmpSaveBtnId);
 
-    if (!saveClicked) {
+    if (!btnSelector) {
       addLog(`임시저장 버튼을 찾을 수 없음: ${tmpSaveBtnId}`, "error");
       await logPageDiagnostics(page);
       sendResult(ws, userId, requestId, false, "임시저장 버튼을 찾을 수 없습니다.");
       return;
     }
 
-    addLog(`임시저장 버튼 클릭: ${saveClicked}`, "info");
+    addLog(`임시저장 버튼 발견: id=${btnSelector.id}, tag=${btnSelector.tagName}, visible=${btnSelector.visible}, disabled=${btnSelector.disabled}, text="${btnSelector.text}"`, "info");
+
+    // Puppeteer 네이티브 클릭 (실제 마우스 이벤트 발생 - 가장 확실한 방법)
+    try {
+      await page.click(btnSelector.selector);
+      addLog(`임시저장 버튼 클릭: puppeteer-click:${btnSelector.selector}`, "info");
+    } catch (clickErr) {
+      // Puppeteer click 실패 시 fallback
+      addLog(`Puppeteer click 실패 (${clickErr.message}), evaluate click 시도`, "warning");
+      await page.evaluate((sel) => {
+        const el = document.querySelector(sel);
+        if (el) {
+          // dispatchEvent로 실제 마우스 이벤트 시뮬레이션
+          el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+        }
+      }, btnSelector.selector);
+      addLog(`임시저장 버튼 클릭: dispatch-click:${btnSelector.selector}`, "info");
+    }
 
     // [FIX] 저장 응답 감시 - 더 구체적인 URL 필터 + 응답 본문 검증
     let saveConfirmed = false;
