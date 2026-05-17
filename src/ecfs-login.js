@@ -372,17 +372,15 @@ async function handleEcfsLogin(payload) {
         try { uuid = crypto.randomUUID(); } catch { uuid = String(Date.now()); }
 
         const requestBody = {
-          data: {
-            dma_certparam: {
-              elpUserId: userId.trim(),
-              signVal: signValArg,
-              encVid: encVidArg,
-              loginType: "P",
-              clientTime: clientTime,
-              apiKey: "",
-              rtnUrl: "",
-              uuid: uuid,
-            }
+          dma_certparam: {
+            elpUserId: userId.trim(),
+            signVal: signValArg,
+            encVid: encVidArg,
+            loginType: "P",
+            clientTime: String(new Date().getTime()),
+            apiKey: "",
+            rtnUrl: "",
+            uuid: uuid,
           }
         };
 
