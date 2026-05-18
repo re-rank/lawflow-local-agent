@@ -236,15 +236,13 @@ async function handleEcfsTempSave(payload, ws, userId) {
 
     addLog(`임시저장 버튼 발견: id=${btnSelector.id}, tag=${btnSelector.tagName}, visible=${btnSelector.visible}, disabled=${btnSelector.disabled}, text="${btnSelector.text}"`, "info");
 
-    // 콘솔 메시지 캡처 (JS 에러 감지용)
+    // 콘솔 메시지 캡처 (모든 레벨 - 핸들러 내부 로그 포함)
     const consoleMessages = [];
     page.on("console", (msg) => {
-      if (msg.type() === "error" || msg.type() === "warning") {
-        consoleMessages.push(`[${msg.type()}] ${msg.text()}`);
-      }
+      consoleMessages.push(`[${msg.type()}] ${msg.text()}`);
     });
 
-    // 모든 네트워크 요청 감시 (어떤 요청이 발생하는지 확인)
+    // 네트워크 요청 감시
     const networkRequests = [];
     page.on("request", (req) => {
       const url = req.url();
@@ -253,58 +251,216 @@ async function handleEcfsTempSave(payload, ws, userId) {
       }
     });
 
-    // ── 버튼 클릭 방법 3단계 시도 ──
+    // ── 임시저장 실행: wframe scwin 스코프 우선 접근 ──
+    // ECFS WebSquare 구조: mf_(최상위) → pfwork(wframe) → btn_tmpSave(컴포넌트)
+    // 버튼 핸들러 scwin.btn_tmpSave_onclick은 pfwork wframe의 scwin에 있으므로
+    // window.scwin(최상위)이 아닌 wframe.getWindow().scwin에서 호출해야 함
 
-    // 방법 1: WebSquare scwin 함수 직접 호출 (가장 확실)
-    const scwinResult = await page.evaluate((btnId) => {
-      try {
-        // WebSquare에서 버튼 onclick 핸들러는 scwin.{btnId}_onclick 형식
-        const scwinScope = window.scwin || (window.$w && window.$w.scwin);
-        if (scwinScope) {
-          const handlerName = `${btnId}_onclick`;
-          if (typeof scwinScope[handlerName] === "function") {
-            scwinScope[handlerName]();
-            return `scwin:${handlerName}`;
+    const clickResult = await page.evaluate((shortBtnId, fullBtnId) => {
+      const api = window.wq || window.$w;
+      const result = { method: null, diag: {} };
+
+      if (!api || typeof api.getComponentById !== "function") {
+        result.diag.error = "WebSquare API 없음";
+        return result;
+      }
+
+      const handlerName = `${shortBtnId}_onclick`;
+
+      // ── 방법 1: wframe 컴포넌트를 통한 scwin 접근 ──
+      const wframeIds = ["mf_pfwork", "pfwork"];
+      for (const wfId of wframeIds) {
+        try {
+          const wf = api.getComponentById(wfId);
+          if (!wf) continue;
+
+          result.diag.wframeFound = wfId;
+          result.diag.wframeType = wf.getPluginName ? wf.getPluginName() : (wf.getType ? wf.getType() : "unknown");
+
+          if (typeof wf.getWindow === "function") {
+            const wfWin = wf.getWindow();
+            if (wfWin && wfWin.scwin) {
+              const fns = Object.keys(wfWin.scwin)
+                .filter((k) => typeof wfWin.scwin[k] === "function");
+              result.diag.wframeFns = fns.slice(0, 30);
+
+              if (typeof wfWin.scwin[handlerName] === "function") {
+                wfWin.scwin[handlerName]();
+                result.method = `wframe:${wfId}:${handlerName}`;
+                return result;
+              }
+
+              // save 관련 함수 검색
+              const saveFns = fns.filter((k) =>
+                k.toLowerCase().includes("tmpsave") ||
+                k.toLowerCase().includes("tmp_save") ||
+                k.toLowerCase().includes("save")
+              );
+              result.diag.saveFns = saveFns;
+              if (saveFns.length > 0) {
+                wfWin.scwin[saveFns[0]]();
+                result.method = `wframe:${wfId}:${saveFns[0]}`;
+                return result;
+              }
+            }
           }
-          // scwin 내 함수 목록에서 tmpSave 관련 함수 검색
-          const tmpSaveFns = Object.keys(scwinScope).filter(
-            (k) => typeof scwinScope[k] === "function" &&
-              (k.toLowerCase().includes("tmpsave") || k.toLowerCase().includes("tmp_save") || k.toLowerCase().includes("임시저장"))
-          );
-          if (tmpSaveFns.length > 0) {
-            scwinScope[tmpSaveFns[0]]();
-            return `scwin:${tmpSaveFns[0]}`;
+
+          // executeScript 방식 시도
+          if (typeof wf.executeScript === "function") {
+            try {
+              wf.executeScript(
+                `if(typeof scwin!=='undefined'&&typeof scwin.${handlerName}==='function')scwin.${handlerName}();`
+              );
+              result.method = `wframe:${wfId}:executeScript`;
+              return result;
+            } catch (e) {
+              result.diag.execScriptErr = e.message;
+            }
           }
-          return { notFound: true, availableFns: Object.keys(scwinScope).filter((k) => typeof scwinScope[k] === "function").slice(0, 30) };
+        } catch (e) {
+          result.diag[`wf_${wfId}_err`] = e.message;
         }
-        return { noScwin: true };
+      }
+
+      // ── 방법 2: DOM에서 wframe 요소 자동 탐색 ──
+      try {
+        const allEls = document.querySelectorAll("[id]");
+        const wfEls = [];
+        for (const el of allEls) {
+          const id = el.id;
+          if (!id || (!id.includes("wfm_") && !id.includes("pfwork"))) continue;
+          try {
+            const comp = api.getComponentById(id);
+            if (!comp || typeof comp.getWindow !== "function") continue;
+            wfEls.push(id);
+            const win = comp.getWindow();
+            if (win && win.scwin && typeof win.scwin[handlerName] === "function") {
+              win.scwin[handlerName]();
+              result.method = `discover:${id}:${handlerName}`;
+              result.diag.discoveredWframes = wfEls;
+              return result;
+            }
+          } catch {}
+        }
+        result.diag.discoveredWframes = wfEls;
       } catch (e) {
-        return { error: e.message };
+        result.diag.discoverErr = e.message;
       }
-    }, tmpSaveBtnId);
 
-    if (typeof scwinResult === "string") {
-      addLog(`임시저장 함수 직접 호출 성공: ${scwinResult}`, "info");
+      // ── 방법 3: top-level scwin ──
+      if (window.scwin) {
+        const topFns = Object.keys(window.scwin)
+          .filter((k) => typeof window.scwin[k] === "function");
+        result.diag.topLevelFns = topFns.slice(0, 20);
+
+        if (typeof window.scwin[handlerName] === "function") {
+          window.scwin[handlerName]();
+          result.method = `topLevel:${handlerName}`;
+          return result;
+        }
+      }
+
+      // ── 방법 4: iframe 내부 scwin 탐색 ──
+      try {
+        const iframes = document.querySelectorAll("iframe");
+        result.diag.iframeCount = iframes.length;
+        const iframeIds = [];
+        for (const iframe of iframes) {
+          iframeIds.push(iframe.id || "(no-id)");
+          try {
+            const iWin = iframe.contentWindow;
+            if (iWin && iWin.scwin && typeof iWin.scwin[handlerName] === "function") {
+              iWin.scwin[handlerName]();
+              result.method = `iframe:${iframe.id}:${handlerName}`;
+              return result;
+            }
+          } catch {}
+        }
+        result.diag.iframeIds = iframeIds;
+      } catch {}
+
+      // ── 방법 5: WebSquare trigger / fireEvent ──
+      try {
+        const btnComp = api.getComponentById(fullBtnId);
+        if (btnComp) {
+          if (typeof btnComp.trigger === "function") {
+            btnComp.trigger("click");
+            result.method = `wsq:trigger:${fullBtnId}`;
+            return result;
+          }
+          if (typeof btnComp.fireEvent === "function") {
+            btnComp.fireEvent("onclick");
+            result.method = `wsq:fireEvent:${fullBtnId}`;
+            return result;
+          }
+        }
+      } catch (e) {
+        result.diag.triggerErr = e.message;
+      }
+
+      return result;
+    }, tmpSaveBtnId, btnSelector.id);
+
+    // 결과 로깅
+    if (clickResult.method) {
+      addLog(`임시저장 호출: ${clickResult.method}`, "info");
     } else {
-      // scwin 함수 호출 실패 → 로그 출력 후 Puppeteer 클릭으로 fallback
-      if (scwinResult?.availableFns) {
-        addLog(`scwin에서 tmpSave 함수 못 찾음. 사용 가능한 함수: ${scwinResult.availableFns.join(", ")}`, "warning");
-      } else {
-        addLog(`scwin 접근 실패: ${JSON.stringify(scwinResult)}`, "warning");
-      }
+      addLog("임시저장 scwin/WebSquare 호출 실패", "warning");
+    }
 
-      // 방법 2: Puppeteer 네이티브 클릭
+    const diag = clickResult.diag || {};
+    if (diag.wframeFound) addLog(`wframe: ${diag.wframeFound} (${diag.wframeType || "?"})`, "info");
+    if (diag.wframeFns) addLog(`wframe scwin 함수(${diag.wframeFns.length}개): ${diag.wframeFns.join(", ")}`, "info");
+    if (diag.saveFns && diag.saveFns.length > 0) addLog(`save 관련 함수: ${diag.saveFns.join(", ")}`, "info");
+    if (diag.topLevelFns) addLog(`top-level scwin(${diag.topLevelFns.length}개): ${diag.topLevelFns.join(", ")}`, "info");
+    if (diag.discoveredWframes && diag.discoveredWframes.length > 0) addLog(`발견된 wframe: ${diag.discoveredWframes.join(", ")}`, "info");
+    if (diag.iframeCount != null) addLog(`iframe 수: ${diag.iframeCount}${diag.iframeIds ? `, IDs: ${diag.iframeIds.join(", ")}` : ""}`, "info");
+    for (const k of Object.keys(diag)) {
+      if (k.endsWith("Err") || k.endsWith("_err")) addLog(`${k}: ${diag[k]}`, "warning");
+    }
+
+    // scwin 호출 실패 시 Puppeteer 프레임에서 scwin 탐색
+    if (!clickResult.method) {
+      const frames = page.frames();
+      addLog(`Puppeteer 프레임 수: ${frames.length}`, "info");
+      for (let i = 1; i < frames.length; i++) {
+        try {
+          const fUrl = frames[i].url();
+          const fResult = await frames[i].evaluate((btnId) => {
+            const h = `${btnId}_onclick`;
+            if (window.scwin && typeof window.scwin[h] === "function") {
+              window.scwin[h]();
+              return { called: h };
+            }
+            if (window.scwin) {
+              return { fns: Object.keys(window.scwin).filter((k) => typeof window.scwin[k] === "function").slice(0, 15) };
+            }
+            return null;
+          }, tmpSaveBtnId);
+
+          if (fResult?.called) {
+            addLog(`프레임[${i}] scwin 호출 성공: ${fResult.called} (${fUrl})`, "info");
+            clickResult.method = `puppeteer-frame[${i}]:${fResult.called}`;
+            break;
+          } else if (fResult?.fns) {
+            addLog(`프레임[${i}] scwin 함수: ${fResult.fns.join(", ")} (${fUrl})`, "info");
+          }
+        } catch {}
+      }
+    }
+
+    // 최종 fallback: Puppeteer native click
+    if (!clickResult.method) {
       try {
         await page.click(btnSelector.selector);
-        addLog(`Puppeteer click: ${btnSelector.selector}`, "info");
+        addLog(`Puppeteer click fallback: ${btnSelector.selector}`, "info");
       } catch (clickErr) {
         addLog(`Puppeteer click 실패: ${clickErr.message}`, "warning");
-        // 방법 3: dispatchEvent
         await page.evaluate((sel) => {
           const el = document.querySelector(sel);
           if (el) el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
         }, btnSelector.selector);
-        addLog(`dispatch-click: ${btnSelector.selector}`, "info");
+        addLog(`dispatch-click fallback: ${btnSelector.selector}`, "info");
       }
     }
 
@@ -358,9 +514,9 @@ async function handleEcfsTempSave(payload, ws, userId) {
       }
     }
 
-    // 콘솔 에러/네트워크 요청 로그 출력
+    // 콘솔 메시지/네트워크 요청 로그 출력
     if (consoleMessages.length > 0) {
-      addLog(`브라우저 콘솔: ${consoleMessages.slice(0, 5).join(" | ")}`, "warning");
+      addLog(`브라우저 콘솔(${consoleMessages.length}건): ${consoleMessages.slice(0, 10).join(" | ")}`, "info");
     }
     if (networkRequests.length > 0) {
       addLog(`감지된 네트워크 요청: ${networkRequests.join(" | ")}`, "info");
